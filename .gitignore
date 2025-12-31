@@ -1,0 +1,15 @@
+# FoldindDiff specific
+.env
+.venv/
+.vscode/
+
+# Weights & Biases
+wandb/
+results/
+
+sequences/
+
+
+#pycache
+__pycache__/
+foldingdiff/*.pkl

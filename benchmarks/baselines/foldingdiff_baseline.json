@@ -1,0 +1,17 @@
+{
+  "name": "foldingdiff_baseline",
+  "description": "Reference metrics for the original FoldingDiff backbone model (fill in from paper or your own runs).",
+  "source": "TODO: add paper / run reference",
+  "metrics": {
+    "tm_score_mean": null,
+    "tm_score_std": null,
+    "rmsd_mean": null,
+    "rmsd_std": null,
+    "success_rate": null,
+    "mean_pairwise_diversity": null,
+    "alpha_fraction": null,
+    "beta_fraction": null
+  }
+}
+
+

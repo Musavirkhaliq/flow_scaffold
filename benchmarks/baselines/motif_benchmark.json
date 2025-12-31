@@ -1,0 +1,17 @@
+{
+  "name": "motif_benchmark",
+  "description": "Reference metrics for a motif-scaffolding benchmark (e.g. RFdiffusion motif set, FrameFlow motifs).",
+  "source": "TODO: add benchmark / dataset reference",
+  "metrics": {
+    "tm_score_mean": null,
+    "tm_score_std": null,
+    "rmsd_mean": null,
+    "rmsd_std": null,
+    "success_rate": null,
+    "mean_pairwise_diversity": null,
+    "alpha_fraction": null,
+    "beta_fraction": null
+  }
+}
+
+
