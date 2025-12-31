@@ -117,7 +117,7 @@ echo "✓ PyTorch found"
 
 # Check ProteinMPNN
 MPNN_FOUND=false
-for mpnn_path in "/home/musa/Documents/augment-projects/foldingdiff/software/ProteinMPNN" "../software/ProteinMPNN" "../../software/ProteinMPNN" "software/ProteinMPNN" "ProteinMPNN"; do
+for mpnn_path in "/disk-10tb/flow_scaffold/software/ProteinMPNN" "../software/ProteinMPNN" "../../software/ProteinMPNN" "software/ProteinMPNN" "ProteinMPNN"; do
     if [ -f "$mpnn_path/protein_mpnn_run.py" ]; then
         echo "✓ ProteinMPNN found at: $mpnn_path"
         MPNN_FOUND=true

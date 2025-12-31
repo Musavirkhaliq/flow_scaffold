@@ -6,6 +6,7 @@ Extends existing datasets to include:
 - Local frames
 - Pairwise distances
 - Secondary structure predictions
+- Amino acid sequences (dummy)
 """
 import logging
 from typing import *
@@ -33,10 +34,12 @@ class EnhancedCathDataset(CathCanonicalAnglesOnlyDataset):
     - Backbone coordinates (N, CA, C, O)
     - Amino acid types (if available)
     - Secondary structure predictions
+    - Amino acid sequences (dummy for now)
     
     Args:
         compute_coords: Whether to compute coordinates from angles
         compute_ss: Whether to compute secondary structure
+        include_sequences: Whether to include amino acid sequences
         **kwargs: Arguments passed to CathCanonicalAnglesOnlyDataset
     """
     
@@ -44,14 +47,16 @@ class EnhancedCathDataset(CathCanonicalAnglesOnlyDataset):
         self,
         compute_coords: bool = True,
         compute_ss: bool = True,
+        include_sequences: bool = False,
         **kwargs
     ):
         super().__init__(**kwargs)
         self.compute_coords = compute_coords
         self.compute_ss = compute_ss
+        self.include_sequences = include_sequences
         
         logging.info(
-            f"EnhancedCathDataset: coords={compute_coords}, ss={compute_ss}"
+            f"EnhancedCathDataset: coords={compute_coords}, ss={compute_ss}, sequences={include_sequences}"
         )
     
     def __getitem__(self, index, ignore_zero_center: bool = False) -> Dict[str, torch.Tensor]:
@@ -63,6 +68,7 @@ class EnhancedCathDataset(CathCanonicalAnglesOnlyDataset):
         - coords: [seq_len, 4, 3] backbone coordinates (if compute_coords)
         - aa_types: [seq_len] amino acid types (20 = unknown)
         - secondary_structure: [seq_len, 3] SS predictions (if compute_ss)
+        - sequences: List[str] amino acid sequences (if include_sequences)
         - attn_mask: [seq_len] attention mask
         - position_ids: [seq_len] position IDs
         - lengths: scalar sequence length
@@ -86,11 +92,33 @@ class EnhancedCathDataset(CathCanonicalAnglesOnlyDataset):
         
         # Add amino acid types (unknown for now)
         # In production, extract from PDB files
+        seq_len = item['angles'].shape[0]
         item['aa_types'] = torch.full(
-            (item['angles'].shape[0],),
+            (seq_len,),
             20,  # 20 = unknown
             dtype=torch.long
         )
+        
+        # Generate dummy amino acid sequence if requested
+        if self.include_sequences:
+            # Generate realistic amino acid sequence
+            aa_freq = {
+                'A': 0.082, 'R': 0.055, 'N': 0.041, 'D': 0.054, 'C': 0.014,
+                'Q': 0.039, 'E': 0.067, 'G': 0.071, 'H': 0.022, 'I': 0.059,
+                'L': 0.096, 'K': 0.058, 'M': 0.024, 'F': 0.039, 'P': 0.047,
+                'S': 0.066, 'T': 0.053, 'W': 0.010, 'Y': 0.029, 'V': 0.069
+            }
+            amino_acids = list(aa_freq.keys())
+            weights = list(aa_freq.values())
+            
+            # Normalize weights to ensure they sum to 1
+            weights = np.array(weights)
+            weights = weights / weights.sum()
+            
+            # Generate sequence based on actual length (not padded)
+            actual_length = item['lengths'].item() if 'lengths' in item else seq_len
+            sequence = ''.join(np.random.choice(amino_acids, size=actual_length, p=weights))
+            item['sequences'] = [sequence]  # List format for batch compatibility
         
         return item
 
@@ -158,6 +186,7 @@ def create_enhanced_dataset(
     toy: int = 0,
     compute_coords: bool = True,
     compute_ss: bool = True,
+    include_sequences: bool = False,
     use_motif_scaffolding: bool = False,
     motif_length_range: Tuple[int, int] = (5, 20),
     motif_prob: float = 0.8,
@@ -174,6 +203,7 @@ def create_enhanced_dataset(
         toy: Toy dataset size (0 = full dataset)
         compute_coords: Compute coordinates from angles
         compute_ss: Compute secondary structure
+        include_sequences: Include amino acid sequences (dummy for now)
         use_motif_scaffolding: Wrap with motif scaffolding
         motif_length_range: Range of motif lengths
         motif_prob: Probability of including motif
@@ -192,6 +222,7 @@ def create_enhanced_dataset(
         toy=toy,
         compute_coords=compute_coords,
         compute_ss=compute_ss,
+        include_sequences=include_sequences,
     )
     
     # Optionally wrap with motif scaffolding

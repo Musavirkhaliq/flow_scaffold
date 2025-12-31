@@ -18,11 +18,11 @@ SAMPLES_DIR="${OUTPUT_BASE}/samples_${EXPERIMENT_NAME}"
 ANALYSIS_DIR="${OUTPUT_BASE}/analysis_${EXPERIMENT_NAME}"
 
 # Training parameters
-EPOCHS=100  # Proper training duration for flow matching (was 10, too few)
+EPOCHS=20  # Proper training duration for flow matching (was 10, too few)
 BATCH_SIZE=16
-LR=5e-5  # Reduced from 1e-4 for training stability
-HIDDEN_SIZE=384
-NUM_LAYERS=12
+LR=6e-4  # Reduced from 1e-4 for training stability
+HIDDEN_SIZE=768
+NUM_LAYERS=32
 MOTIF_MIN=5
 MOTIF_MAX=20
 GUIDANCE_DROPOUT=0.1
@@ -111,7 +111,7 @@ TRAIN_CMD="python bin/train_enhanced_flow.py \
     --lr_scheduler LinearWarmup \
     --output_dir ${OUTPUT_BASE} \
     --experiment_name ${EXPERIMENT_NAME} \
-    --gpus 1 \
+    --gpus 4 \
     --num_workers 4 \
     --seed 42"
 

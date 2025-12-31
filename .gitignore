@@ -6,6 +6,7 @@
 # Weights & Biases
 wandb/
 results/
+data/
 
 sequences/
 

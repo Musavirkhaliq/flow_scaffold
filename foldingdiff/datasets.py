@@ -24,7 +24,7 @@ from torch.utils.data import Dataset
 # LOCAL_DATA_DIR = Path(
 #     os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "data")
 # )
-LOCAL_DATA_DIR="/home/musa/Documents/augment-projects/foldingdiff/data"
+LOCAL_DATA_DIR="/disk-10tb/flow_scaffold/data"
 
 CATH_DIR = LOCAL_DATA_DIR +"/cath"
 ALPHAFOLD_DIR = LOCAL_DATA_DIR+"/alphafold"
