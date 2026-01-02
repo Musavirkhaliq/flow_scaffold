@@ -18,9 +18,9 @@ SAMPLES_DIR="${OUTPUT_BASE}/samples_${EXPERIMENT_NAME}"
 ANALYSIS_DIR="${OUTPUT_BASE}/analysis_${EXPERIMENT_NAME}"
 
 # Training parameters (adjusted for advanced model)
-EPOCHS=1  # More epochs for complex model
-BATCH_SIZE=16  # Smaller due to larger model
-LR=3e-4  # Higher LR for advanced features
+EPOCHS=150  # More epochs for complex model
+BATCH_SIZE=32  # Smaller due to larger model
+LR=1e-4  # Higher LR for advanced features
 HIDDEN_SIZE=512  # Larger for multi-modal features
 NUM_LAYERS=12
 NUM_HEADS=16  # More heads for multi-modal attention
@@ -51,7 +51,7 @@ USE_MULTISCALE_LOSS=true
 USE_CONSISTENCY_LOSS=true
 USE_GEOMETRIC_LOSS=true
 CONSISTENCY_WEIGHT=0.1
-GEOMETRIC_WEIGHT=0.05
+GEOMETRIC_WEIGHT=0.3
 
 # Sampling parameters (optimized for advanced model)
 N_SAMPLES=25  # More samples for better evaluation
@@ -272,10 +272,35 @@ echo "✓ All advanced sampling complete!"
 echo ""
 
 # ==========================================
-# PHASE 3: COMPREHENSIVE ANALYSIS
+# PHASE 3: COMPREHENSIVE EVALUATION
 # ==========================================
 echo "=========================================="
-echo "PHASE 3: COMPREHENSIVE ANALYSIS"
+echo "PHASE 3: COMPREHENSIVE EVALUATION"
+echo "=========================================="
+echo ""
+
+# Run comprehensive evaluation using the evaluation framework
+EVALUATION_DIR="${ANALYSIS_DIR}/evaluation"
+
+echo "Running comprehensive evaluation..."
+echo "  Samples: ${SAMPLES_DIR}"
+echo "  Output: ${EVALUATION_DIR}"
+echo ""
+
+python evaluations/evaluate_sampled_backbones.py \
+    --samples_dir ${SAMPLES_DIR} \
+    --output_dir ${EVALUATION_DIR} \
+    --n_threads $(nproc)
+
+echo ""
+echo "✓ Comprehensive evaluation complete!"
+echo ""
+
+# ==========================================
+# PHASE 4: COMPREHENSIVE ANALYSIS
+# ==========================================
+echo "=========================================="
+echo "PHASE 4: COMPREHENSIVE ANALYSIS"
 echo "=========================================="
 echo ""
 
@@ -671,10 +696,10 @@ echo "✓ Advanced analysis complete!"
 echo ""
 
 # ==========================================
-# PHASE 4: MODEL COMPARISON
+# PHASE 5: MODEL COMPARISON
 # ==========================================
 echo "=========================================="
-echo "PHASE 4: MODEL COMPARISON"
+echo "PHASE 5: MODEL COMPARISON"
 echo "=========================================="
 echo ""
 
@@ -693,10 +718,10 @@ echo "✓ Model comparison complete!"
 echo ""
 
 # ==========================================
-# PHASE 5: GENERATE COMPREHENSIVE REPORT
+# PHASE 6: GENERATE COMPREHENSIVE REPORT
 # ==========================================
 echo "=========================================="
-echo "PHASE 5: GENERATING COMPREHENSIVE REPORT"
+echo "PHASE 6: GENERATING COMPREHENSIVE REPORT"
 echo "=========================================="
 echo ""
 
@@ -805,6 +830,26 @@ done
 cat >> ${REPORT_FILE} << EOF
 
 ## Results
+
+### Comprehensive Evaluation
+
+The comprehensive evaluation framework computed the following metrics:
+
+1. **Energy/Physical Plausibility** - Ramachandran quality, VDW clashes, Rosetta energy (if available), AlphaFold2 confidence (if available)
+2. **Novelty & Diversity** - Structural diversity (pairwise RMSD/TM-score), sequence diversity, novelty vs. database
+3. **Structural Similarity** - RMSD, TM-score, GDT scores (if reference structures provided)
+4. **Motif Recovery** - Motif preservation, superposition accuracy, interface quality (if motifs specified)
+5. **Sequence-Structure Compatibility** - Recovery rates, similarity metrics (if reference provided)
+
+**Evaluation Results:** \`${EVALUATION_DIR}/\`
+
+Key metrics available:
+- \`energy_plausibility.csv\` - Quality and plausibility scores
+- \`novelty_diversity.csv\` - Diversity and novelty metrics
+- \`structural_similarity.csv\` - RMSD, TM-score, GDT (if reference provided)
+- \`motif_recovery.csv\` - Motif-specific metrics (if motifs provided)
+- \`sequence_structure_compatibility.csv\` - Sequence metrics (if reference provided)
+- \`evaluation_summary.json\` - Overall statistics
 
 ### Advanced Comparison Table
 
@@ -1002,6 +1047,7 @@ echo ""
 echo "Results:"
 echo "  ✓ Advanced model trained: ${MODEL_DIR}"
 echo "  ✓ Enhanced samples generated: ${SAMPLES_DIR}"
+echo "  ✓ Comprehensive evaluation: ${EVALUATION_DIR}"
 echo "  ✓ Comprehensive analysis: ${ANALYSIS_DIR}"
 echo "  ✓ Detailed report: ${REPORT_FILE}"
 echo "  ✓ Model comparison: ${ANALYSIS_DIR}/model_comparison.json"

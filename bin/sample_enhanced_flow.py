@@ -28,6 +28,8 @@ from foldingdiff.enhanced_models import BertForFlowMatchingEnhanced
 from foldingdiff.flow_sampling import sample_flow_matching_with_guidance
 from foldingdiff.motif_scaffolding import create_motif_mask_from_regions
 from foldingdiff import angles_and_coords
+from foldingdiff.reference_saving import load_and_save_references
+from foldingdiff.datasets import CathCanonicalAnglesOnlyDataset
 import pandas as pd
 
 
@@ -115,6 +117,12 @@ def main():
     parser.add_argument("--save_pdb", action="store_true")
     parser.add_argument("--save_angles", action="store_true")
     
+    # Reference structures
+    parser.add_argument("--save_references", action="store_true", default=True,
+                       help="Automatically save reference structures from CATH for comparison")
+    parser.add_argument("--reference_seed", type=int, default=None,
+                       help="Random seed for reference structure selection")
+    
     args = parser.parse_args()
     
     # Set up logging
@@ -128,9 +136,8 @@ def main():
     output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
     
-    # Save sampling args
-    with open(output_dir / "sampling_args.json", "w") as f:
-        json.dump(vars(args), f, indent=2)
+    # Initialize reference_paths (will be populated later if save_references is True)
+    reference_paths = []
     
     logger.info("=" * 80)
     logger.info("ENHANCED FLOW MATCHING SAMPLING")
@@ -156,6 +163,44 @@ def main():
     # Parse motif regions
     motif_regions = parse_motif_spec(args.motif_regions)
     logger.info(f"✓ Motif regions: {motif_regions if motif_regions else 'None (unconditional)'}")
+    
+    # Load and save reference structures if requested
+    reference_paths = []
+    if args.save_references:
+        logger.info("\n" + "=" * 80)
+        logger.info("LOADING REFERENCE STRUCTURES")
+        logger.info("=" * 80)
+        try:
+            # Create CATH dataset for loading references
+            ref_dataset = CathCanonicalAnglesOnlyDataset(
+                pdbs="cath",
+                split=None,  # Use all data
+                pad=512,
+                min_length=max(40, args.length - 20),
+            )
+            
+            reference_paths = load_and_save_references(
+                n_samples=args.n_samples,
+                output_dir=output_dir,
+                dataset=ref_dataset,
+                length=args.length,
+                motif_regions=motif_regions if motif_regions else None,
+                save_pdb=args.save_pdb,
+                seed=args.reference_seed
+            )
+            
+            n_saved = sum(1 for p in reference_paths if p is not None)
+            logger.info(f"✓ Saved {n_saved}/{args.n_samples} reference structures")
+            logger.info(f"✓ References saved to {output_dir / 'references'}")
+        except Exception as e:
+            logger.warning(f"Failed to save reference structures: {e}")
+            logger.warning("Continuing without references...")
+    
+    # Save sampling args (after reference_paths is populated)
+    sampling_args = vars(args).copy()
+    sampling_args['reference_paths'] = [str(p) if p else None for p in reference_paths] if args.save_references else []
+    with open(output_dir / "sampling_args.json", "w") as f:
+        json.dump(sampling_args, f, indent=2)
     
     # Prepare motif data
     pad_length = train_args.get("pad", 128)
@@ -230,14 +275,25 @@ def main():
             pdb_file = pdb_dir / f"sample_{i:04d}.pdb"
             
             # CRITICAL: Add means back to angles
-            # The model learned mean-centered angles, so we need to add the means back
-            sample_corrected = sample.clone()
-            # Omega: add π (180°) for trans peptide bonds
-            sample_corrected[:, 2] += np.pi  # omega: add 180° in radians
-            # Bond angles: add their natural means
-            sample_corrected[:, 3] += 1.92  # tau: add ~110° in radians
-            sample_corrected[:, 4] += 2.01  # CA:C:1N: add ~115° in radians
-            sample_corrected[:, 5] += 2.11  # C:1N:1CA: add ~121° in radians
+            # Use proper mean application with wrapping
+            from foldingdiff.mean_utils import load_training_means, apply_means_with_wrapping
+            
+            # Load means (will compute from dataset if not saved)
+            training_means, _ = load_training_means(
+                model_dir=Path(args.model_dir),
+                pdbs="cath",
+                split=None,
+                pad=512,
+                min_length=40
+            )
+            
+            sample_np = sample.numpy()
+            sample_corrected_np = apply_means_with_wrapping(
+                sample_np,
+                training_means,
+                is_angular=[True, True, True, False, False, False]
+            )
+            sample_corrected = torch.from_numpy(sample_corrected_np).float()
             
             # Create dataframe with angles and distances
             angles_df = pd.DataFrame({
@@ -286,8 +342,8 @@ def main():
     logger.info(f"✓ Results saved to {output_dir}")
     logger.info("\nNext steps:")
     logger.info("1. Visualize: pymol " + str(pdb_dir / "*.pdb"))
-    logger.info("2. Evaluate: python bin/evaluate_samples.py")
-    logger.info("3. Design sequences: python bin/design_sequences.py")
+    logger.info("2. Evaluate comprehensively: python evaluations/evaluate_sampled_backbones.py --samples_dir " + str(output_dir))
+    logger.info("3. Design sequences: python bin/design_sequences_mpnn.py")
     logger.info("=" * 80)
 
 

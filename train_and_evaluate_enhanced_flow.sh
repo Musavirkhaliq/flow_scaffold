@@ -203,10 +203,35 @@ echo "✓ All sampling complete!"
 echo ""
 
 # ==========================================
-# PHASE 3: COMPREHENSIVE ANALYSIS
+# PHASE 3: COMPREHENSIVE EVALUATION
 # ==========================================
 echo "=========================================="
-echo "PHASE 3: COMPREHENSIVE ANALYSIS"
+echo "PHASE 3: COMPREHENSIVE EVALUATION"
+echo "=========================================="
+echo ""
+
+# Run comprehensive evaluation using the evaluation framework
+EVALUATION_DIR="${ANALYSIS_DIR}/evaluation"
+
+echo "Running comprehensive evaluation..."
+echo "  Samples: ${SAMPLES_DIR}"
+echo "  Output: ${EVALUATION_DIR}"
+echo ""
+
+python evaluations/evaluate_sampled_backbones.py \
+    --samples_dir ${SAMPLES_DIR} \
+    --output_dir ${EVALUATION_DIR} \
+    --n_threads $(nproc)
+
+echo ""
+echo "✓ Comprehensive evaluation complete!"
+echo ""
+
+# ==========================================
+# PHASE 4: COMPREHENSIVE ANALYSIS
+# ==========================================
+echo "=========================================="
+echo "PHASE 4: COMPREHENSIVE ANALYSIS"
 echo "=========================================="
 echo ""
 
@@ -489,10 +514,10 @@ echo "✓ Analysis complete!"
 echo ""
 
 # ==========================================
-# PHASE 4: GENERATE SUMMARY REPORT
+# PHASE 5: GENERATE SUMMARY REPORT
 # ==========================================
 echo "=========================================="
-echo "PHASE 4: GENERATING SUMMARY REPORT"
+echo "PHASE 5: GENERATING SUMMARY REPORT"
 echo "=========================================="
 echo ""
 
@@ -574,6 +599,18 @@ done
 cat >> ${REPORT_FILE} << EOF
 
 ## Results
+
+### Comprehensive Evaluation
+
+The comprehensive evaluation framework computed the following metrics:
+
+1. **Energy/Physical Plausibility** - Ramachandran quality, VDW clashes, overall quality scores
+2. **Novelty & Diversity** - Structural diversity, sequence diversity, novelty vs. database
+3. **Structural Similarity** - RMSD, TM-score, GDT (if reference structures provided)
+4. **Motif Recovery** - Motif preservation, interface quality (if motifs specified)
+5. **Sequence-Structure Compatibility** - Recovery rates, similarity metrics (if reference provided)
+
+**Evaluation Results:** \`${EVALUATION_DIR}/\`
 
 ### Comparison Table
 
@@ -708,10 +745,12 @@ echo "Summary:"
 echo "  ✓ Phase 1: Conditional motif scaffolding"
 echo "  ✓ Phase 2: Flow matching (20x faster)"
 echo "  ✓ Phase 3: Enhanced embeddings (9x richer)"
+echo "  ✓ Phase 4: Comprehensive evaluation"
 echo ""
 echo "Results:"
 echo "  ✓ Model trained: ${MODEL_DIR}"
 echo "  ✓ Samples generated: ${SAMPLES_DIR}"
+echo "  ✓ Comprehensive evaluation: ${EVALUATION_DIR}"
 echo "  ✓ Analysis completed: ${ANALYSIS_DIR}"
 echo "  ✓ Report: ${REPORT_FILE}"
 echo ""

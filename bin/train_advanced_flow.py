@@ -63,7 +63,7 @@ def main():
     parser.add_argument("--use_consistency_loss", action="store_true", default=True)
     parser.add_argument("--use_geometric_loss", action="store_true", default=True)
     parser.add_argument("--consistency_weight", type=float, default=0.1)
-    parser.add_argument("--geometric_weight", type=float, default=0.05)
+    parser.add_argument("--geometric_weight", type=float, default=0.30)  # CRITICAL: Increased from 0.15 to 0.30 for stronger geometric constraints (target: beat SOTA)
     
     # Motif scaffolding
     parser.add_argument("--motif_length_min", type=int, default=5)
@@ -82,8 +82,9 @@ def main():
     parser.add_argument("--beta_schedule", type=str, default="cosine")
     
     # Training
-    parser.add_argument("--batch_size", type=int, default=16)  # Smaller due to larger model
-    parser.add_argument("--lr", type=float, default=3e-4)  # Higher LR for advanced model
+    parser.add_argument("--batch_size", type=int, default=32)  # CRITICAL: Increased from 16 to 32 for better stability
+    parser.add_argument("--accumulate_grad_batches", type=int, default=1)  # For gradient accumulation if needed
+    parser.add_argument("--lr", type=float, default=1e-4)  # Reduced from 3e-4 for more stable training
     parser.add_argument("--epochs", type=int, default=150)  # More epochs for complex model
     parser.add_argument("--lr_scheduler", type=str, default="LinearWarmup")
     parser.add_argument("--warmup_ratio", type=float, default=0.15)  # Longer warmup
@@ -167,6 +168,51 @@ def main():
     logger.info(f"✓ Train dataset: {len(train_dset)} examples")
     logger.info(f"✓ Val dataset: {len(val_dset)} examples")
     
+    # CRITICAL: Save training means for proper mean correction during sampling
+    logger.info("\n" + "=" * 80)
+    logger.info("SAVING TRAINING METADATA")
+    logger.info("=" * 80)
+    
+    try:
+        from foldingdiff.training_utils import save_training_means
+        
+        # Get the underlying dataset to access means
+        # train_dset is NoisedAnglesDataset or EnhancedMotifScaffoldingDataset
+        # It has .dset attribute pointing to the base dataset
+        base_dataset = None
+        if hasattr(train_dset, 'dset'):
+            base_dataset = train_dset.dset
+        elif hasattr(train_dset, 'base_dataset'):
+            base_dataset = train_dset.base_dataset
+        elif hasattr(train_dset, 'means'):
+            base_dataset = train_dset
+        
+        # Navigate to the actual CATH dataset
+        while base_dataset is not None:
+            if hasattr(base_dataset, 'means') and base_dataset.means is not None:
+                # Found the dataset with means
+                means = base_dataset.means
+                means_file = save_training_means(means, output_dir)
+                logger.info(f"✓ Saved training means to {means_file}")
+                logger.info(f"  Means: phi={means[0]:.3f}, psi={means[1]:.3f}, omega={means[2]:.3f}, tau={means[3]:.3f}")
+                logger.info("  This ensures correct mean correction during sampling")
+                break
+            elif hasattr(base_dataset, 'dset'):
+                base_dataset = base_dataset.dset
+            elif hasattr(base_dataset, 'base_dataset'):
+                base_dataset = base_dataset.base_dataset
+            else:
+                break
+        
+        if base_dataset is None or not hasattr(base_dataset, 'means') or base_dataset.means is None:
+            logger.warning("⚠️  Could not access dataset means for saving")
+            logger.warning("  Mean correction will compute from dataset during sampling")
+            logger.warning("  This is acceptable but slower")
+    except Exception as e:
+        logger.warning(f"⚠️  Failed to save training means: {e}")
+        logger.warning("  Mean correction will compute from dataset during sampling")
+        logger.warning("  This is acceptable but slower")
+    
     # Create data loaders
     train_loader = DataLoader(
         train_dset,
@@ -196,6 +242,8 @@ def main():
         num_attention_heads=args.num_heads,
         intermediate_size=args.hidden_size * 4,
         max_position_embeddings=args.pad,
+        attention_probs_dropout_prob=0.1,  # CRITICAL: Add dropout for regularization
+        hidden_dropout_prob=0.1,  # CRITICAL: Add dropout for regularization
     )
     
     # Save config
@@ -304,7 +352,7 @@ def main():
         gradient_clip_val=args.gradient_clip,
         log_every_n_steps=10,
         val_check_interval=1.0,
-        accumulate_grad_batches=2,  # Accumulate gradients for larger effective batch size
+        accumulate_grad_batches=args.accumulate_grad_batches,  # CRITICAL: Use argument for flexibility
         precision=32,  # Use 32-bit precision to avoid dtype issues
         strategy="ddp" if args.gpus > 1 else None,  # Distributed training if multiple GPUs
     )

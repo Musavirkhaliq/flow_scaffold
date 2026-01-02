@@ -35,7 +35,11 @@ from foldingdiff.advanced_flow_matching import (
 )
 from foldingdiff.flow_sampling import sample_flow_matching_with_guidance
 from foldingdiff.motif_scaffolding import create_motif_mask_from_regions
-from foldingdiff import angles_and_coords
+from foldingdiff import angles_and_coords, utils
+from foldingdiff.reference_saving import load_and_save_references
+from foldingdiff.datasets import CathCanonicalAnglesOnlyDataset
+from foldingdiff import geometric_validation, structure_refinement
+from foldingdiff.mean_utils import load_training_means, apply_means_with_wrapping
 import pandas as pd
 
 
@@ -104,8 +108,22 @@ def parse_motif_spec(motif_spec: str) -> List[tuple]:
     return regions
 
 
-def generate_dummy_sequence(length: int) -> str:
-    """Generate a dummy amino acid sequence for testing"""
+def generate_dummy_sequence(length: int, seed: Optional[int] = None) -> str:
+    """
+    Generate a dummy amino acid sequence for testing.
+    
+    Args:
+        length: Sequence length
+        seed: Random seed for reproducibility (None = random)
+    
+    Returns:
+        Random amino acid sequence
+    """
+    if seed is not None:
+        rng = np.random.RandomState(seed)
+    else:
+        rng = np.random
+    
     # Use realistic amino acid frequencies
     aa_freq = {
         'A': 0.082, 'R': 0.055, 'N': 0.041, 'D': 0.054, 'C': 0.014,
@@ -120,7 +138,12 @@ def generate_dummy_sequence(length: int) -> str:
     # Normalize weights to ensure they sum to 1
     weights = weights / weights.sum()
     
-    return ''.join(np.random.choice(amino_acids, size=length, p=weights))
+    # Generate unique sequence each time (use current time as seed if no seed provided)
+    if seed is None:
+        seed = int(np.random.randint(0, 2**31))
+        rng = np.random.RandomState(seed)
+    
+    return ''.join(rng.choice(amino_acids, size=length, p=weights))
 
 
 def sample_advanced_flow_matching(
@@ -178,7 +201,10 @@ def sample_advanced_flow_matching(
         motif_angles = torch.zeros(pad_length, 6)
     
     # Generate dummy sequence for sequence-augmented flow matching
-    sequence = generate_dummy_sequence(length)
+    # Use sample index as seed to ensure diversity
+    import time
+    sequence_seed = int(time.time() * 1000) % (2**31)  # Use timestamp for diversity
+    sequence = generate_dummy_sequence(length, seed=sequence_seed)
     
     # Prepare batch
     batch = {
@@ -310,6 +336,17 @@ def sample_with_geometric_inverse_design(
                     motif_coords=batch.get('coords_computed')[:, :10, :, :],
                 )
                 x = x + dt * (k1 + 2*k2 + 2*k3 + k4) / 6
+            
+            # CRITICAL: Wrap angular features after each step
+            # phi, psi, omega are angular (indices 0, 1, 2)
+            is_angular = [True, True, True, False, False, False]
+            for j, angular in enumerate(is_angular):
+                if angular:
+                    x[:, :, j] = utils.modulo_with_wrapped_range(
+                        x[:, :, j],
+                        range_min=-torch.pi,
+                        range_max=torch.pi
+                    )
     
     return x[0, :length, :].cpu()
 
@@ -371,6 +408,17 @@ def sample_with_advanced_features(
                 # Simplified RK4 for speed
                 k1 = v_pred
                 x = x + dt * k1
+            
+            # CRITICAL: Wrap angular features after each step
+            # phi, psi, omega are angular (indices 0, 1, 2)
+            is_angular = [True, True, True, False, False, False]
+            for j, angular in enumerate(is_angular):
+                if angular:
+                    x[:, :, j] = utils.modulo_with_wrapped_range(
+                        x[:, :, j],
+                        range_min=-torch.pi,
+                        range_max=torch.pi
+                    )
     
     return x[0, :length, :].cpu()
 
@@ -400,6 +448,18 @@ def main():
     parser.add_argument("--use_sequence_augmentation", action="store_true", default=True,
                        help="Use FoldFlow++ sequence augmentation")
     
+    # Quality control
+    parser.add_argument("--validate_geometry", action="store_true", default=True,
+                       help="Validate geometric quality during sampling")
+    parser.add_argument("--reject_low_quality", action="store_true", default=False,
+                       help="Reject and resample low-quality structures")
+    parser.add_argument("--min_quality_score", type=float, default=0.2,
+                       help="Minimum quality score to accept (0-1)")
+    parser.add_argument("--refine_structures", action="store_true", default=False,
+                       help="Apply post-processing refinement")
+    parser.add_argument("--max_rejection_attempts", type=int, default=3,
+                       help="Maximum attempts to resample if quality is low")
+    
     # Motif conditioning
     parser.add_argument("--motif_regions", type=str, default="")
     parser.add_argument("--guidance_scale", type=float, default=2.0)
@@ -409,6 +469,12 @@ def main():
     parser.add_argument("--save_pdb", action="store_true", default=True)
     parser.add_argument("--save_angles", action="store_true", default=True)
     parser.add_argument("--save_analysis", action="store_true", default=True)
+    
+    # Reference structures
+    parser.add_argument("--save_references", action="store_true", default=True,
+                       help="Automatically save reference structures from CATH for comparison")
+    parser.add_argument("--reference_seed", type=int, default=None,
+                       help="Random seed for reference structure selection")
     
     args = parser.parse_args()
     
@@ -423,9 +489,8 @@ def main():
     output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
     
-    # Save sampling args
-    with open(output_dir / "sampling_args.json", "w") as f:
-        json.dump(vars(args), f, indent=2)
+    # Initialize reference_paths (will be populated later if save_references is True)
+    reference_paths = []
     
     logger.info("=" * 80)
     logger.info("ADVANCED FLOW MATCHING SAMPLING")
@@ -452,6 +517,27 @@ def main():
     model, train_args = load_advanced_model(args.model_dir, args.device)
     
     logger.info("✓ Advanced model loaded successfully")
+    
+    # Load training means with best-effort fallback
+    logger.info("\n" + "=" * 80)
+    logger.info("LOADING TRAINING MEANS")
+    logger.info("=" * 80)
+    
+    training_means, means_source = load_training_means(
+        model_dir=args.model_dir,
+        pdbs="cath",
+        split=None,
+        pad=512,  # Should match training pad
+        min_length=40  # Should match training min_length
+    )
+    
+    if means_source == "file":
+        logger.info("✓ Using means from saved file (most reliable)")
+    elif means_source == "dataset":
+        logger.info("✓ Using means computed from dataset (reliable)")
+    else:
+        logger.warning("⚠️  Using hardcoded means (may be incorrect!)")
+        logger.warning("  Consider saving means during training for best results")
     logger.info("✓ Research advances incorporated:")
     logger.info("  • FrameFlow extensions (motif amortization & guidance)")
     logger.info("  • FoldFlow++ (sequence-augmented flow matching)")
@@ -462,6 +548,44 @@ def main():
     # Parse motif regions
     motif_regions = parse_motif_spec(args.motif_regions)
     logger.info(f"✓ Motif regions: {motif_regions if motif_regions else 'None (unconditional)'}")
+    
+    # Load and save reference structures if requested
+    reference_paths = []
+    if args.save_references:
+        logger.info("\n" + "=" * 80)
+        logger.info("LOADING REFERENCE STRUCTURES")
+        logger.info("=" * 80)
+        try:
+            # Create CATH dataset for loading references
+            ref_dataset = CathCanonicalAnglesOnlyDataset(
+                pdbs="cath",
+                split=None,  # Use all data
+                pad=512,
+                min_length=max(40, args.length - 20),
+            )
+            
+            reference_paths = load_and_save_references(
+                n_samples=args.n_samples,
+                output_dir=output_dir,
+                dataset=ref_dataset,
+                length=args.length,
+                motif_regions=motif_regions if motif_regions else None,
+                save_pdb=args.save_pdb,
+                seed=args.reference_seed
+            )
+            
+            n_saved = sum(1 for p in reference_paths if p is not None)
+            logger.info(f"✓ Saved {n_saved}/{args.n_samples} reference structures")
+            logger.info(f"✓ References saved to {output_dir / 'references'}")
+        except Exception as e:
+            logger.warning(f"Failed to save reference structures: {e}")
+            logger.warning("Continuing without references...")
+    
+    # Save sampling args (after reference_paths is populated)
+    sampling_args = vars(args).copy()
+    sampling_args['reference_paths'] = [str(p) if p else None for p in reference_paths] if args.save_references else []
+    with open(output_dir / "sampling_args.json", "w") as f:
+        json.dump(sampling_args, f, indent=2)
     
     # Sample
     logger.info("\n" + "=" * 80)
@@ -476,20 +600,62 @@ def main():
     
     samples = []
     sample_info = []
+    quality_stats = []
     
     for i in tqdm(range(args.n_samples), desc="Generating advanced samples"):
-        # Sample with advanced flow matching
-        sample = sample_advanced_flow_matching(
-            model=model,
-            length=args.length,
-            motif_regions=motif_regions,
-            guidance_scale=args.guidance_scale,
-            num_steps=args.num_steps,
-            method=args.method,
-            use_geometric_inverse_design=args.use_geometric_inverse_design,
-            use_motif_amortization=args.use_motif_amortization,
-            device=args.device
-        )
+        # Sample with advanced flow matching (with rejection if enabled)
+        sample = None
+        quality = None
+        attempts = 0
+        
+        while sample is None or (args.reject_low_quality and attempts < args.max_rejection_attempts):
+            # Sample with advanced flow matching
+            sample = sample_advanced_flow_matching(
+                model=model,
+                length=args.length,
+                motif_regions=motif_regions,
+                guidance_scale=args.guidance_scale,
+                num_steps=args.num_steps,
+                method=args.method,
+                use_geometric_inverse_design=args.use_geometric_inverse_design,
+                use_motif_amortization=args.use_motif_amortization,
+                device=args.device
+            )
+            
+            # Validate geometry if enabled
+            if args.validate_geometry:
+                quality = geometric_validation.validate_structure_quality(sample)
+                
+                # Check if quality is acceptable
+                if args.reject_low_quality:
+                    if quality['quality_score'] < args.min_quality_score:
+                        attempts += 1
+                        if attempts < args.max_rejection_attempts:
+                            logger.debug(f"Sample {i}: Quality {quality['quality_score']:.3f} < {args.min_quality_score}, resampling...")
+                            sample = None
+                            continue
+                        else:
+                            logger.warning(f"Sample {i}: Quality {quality['quality_score']:.3f} still low after {attempts} attempts, keeping anyway")
+            
+            break  # Accept sample
+        
+        # Note: Omega fix will be applied AFTER mean correction (see below)
+        # This is critical because:
+        # - Model learned mean-centered angles (omega ~0)
+        # - Omega mean is ~π
+        # - After adding mean: omega = 0 + π = π (trans) ✓
+        # - If we fix to π first, then add mean: π + π = 2π → wraps to 0 (cis) ✗
+        
+        # Apply refinement if enabled (before mean correction)
+        if args.refine_structures and sample is not None:
+            sample, improvement = structure_refinement.refine_structure(
+                sample,
+                improve_ramachandran=True,
+                fix_omega=False,  # Will fix after mean correction
+                target_rama_favored=0.4
+            )
+            if quality:
+                quality['refinement_improvement'] = improvement['quality_improvement']
         
         samples.append(sample)
         
@@ -504,9 +670,30 @@ def main():
             'geometric_inverse_design': args.use_geometric_inverse_design,
             'motif_amortization': args.use_motif_amortization,
         }
+        
+        if quality:
+            info['quality_score'] = quality['quality_score']
+            info['rama_favored'] = quality['rama_favored']
+            info['rama_outliers'] = quality['rama_outliers']
+            quality_stats.append(quality)
+        
         sample_info.append(info)
     
     logger.info(f"\n✓ Generated {len(samples)} advanced samples")
+    
+    # Report quality statistics if validation was enabled
+    if args.validate_geometry and quality_stats:
+        avg_quality = np.mean([q['quality_score'] for q in quality_stats])
+        avg_rama_favored = np.mean([q['rama_favored'] for q in quality_stats])
+        avg_rama_outliers = np.mean([q['rama_outliers'] for q in quality_stats])
+        logger.info(f"\nQuality Statistics:")
+        logger.info(f"  Mean Quality Score: {avg_quality:.3f}")
+        logger.info(f"  Mean Ramachandran Favored: {avg_rama_favored:.1%}")
+        logger.info(f"  Mean Ramachandran Outliers: {avg_rama_outliers:.1%}")
+        
+        if args.reject_low_quality:
+            n_rejected = sum(1 for q in quality_stats if q['quality_score'] < args.min_quality_score)
+            logger.info(f"  Samples below threshold: {n_rejected}/{len(quality_stats)}")
     
     # Save samples
     logger.info("\n" + "=" * 80)
@@ -537,11 +724,23 @@ def main():
             pdb_file = pdb_dir / f"sample_{i:04d}.pdb"
             
             # Add means back to angles (model learned mean-centered)
-            sample_corrected = sample.clone()
-            sample_corrected[:, 2] += np.pi  # omega: add 180° for trans
-            sample_corrected[:, 3] += 1.92  # tau: add ~110°
-            sample_corrected[:, 4] += 2.01  # CA:C:1N: add ~115°
-            sample_corrected[:, 5] += 2.11  # C:1N:1CA: add ~121°
+            # Use proper mean application with wrapping
+            sample_np = sample.numpy()
+            sample_corrected_np = apply_means_with_wrapping(
+                sample_np,
+                training_means,
+                is_angular=[True, True, True, False, False, False]
+            )
+            
+            # CRITICAL: Fix omega angles to trans (π) AFTER applying means
+            # This is essential because:
+            # - Model learned mean-centered angles (omega ~0)
+            # - Omega mean is ~π, so after adding mean: omega = 0 + π = π (trans) ✓
+            # - But wrapping might cause issues, so explicitly set to π
+            # - This ensures omega is exactly π (trans) for all residues
+            sample_corrected_np[:, 2] = np.pi
+            
+            sample_corrected = torch.from_numpy(sample_corrected_np).float()
             
             # Create dataframe with angles and distances
             angles_df = pd.DataFrame({
@@ -680,10 +879,10 @@ def main():
     logger.info(f"✓ Results saved to {output_dir}")
     logger.info("\nNext steps:")
     logger.info("1. Visualize: pymol " + str(pdb_dir / "*.pdb"))
-    logger.info("2. Evaluate: python bin/evaluate_advanced_samples.py")
+    logger.info("2. Evaluate comprehensively: python evaluations/evaluate_sampled_backbones.py --samples_dir " + str(output_dir))
     logger.info("3. Compare: python bin/compare_flow_models.py")
     logger.info("4. Benchmark: python benchmarks/compare_to_baselines.py")
-    logger.info("5. Design sequences: python bin/design_sequences.py")
+    logger.info("5. Design sequences: python bin/design_sequences_mpnn.py")
     logger.info("=" * 80)
 
 
