@@ -112,6 +112,7 @@ class CathCanonicalAnglesDataset(Dataset):
         zero_center: bool = True,  # Center the features to have 0 mean
         use_cache: bool = True,  # Use/build cached computations of dihedrals and angles
         cache_dir: Path = Path(os.path.dirname(os.path.abspath(__file__))),
+        force_use_cache: bool = True,  # NEW: Use cached data even if codebase hash doesn't match (avoids recomputation)
     ) -> None:
         super().__init__()
         assert pad > min_length
@@ -142,21 +143,60 @@ class CathCanonicalAnglesDataset(Dataset):
 
             logging.info(f"Loading toy dataset of {toy} structures")
             self.structures = self.__compute_featurization(fnames)
-        elif use_cache and os.path.exists(self.cache_fname):
-            logging.info(f"Loading cached full dataset from {self.cache_fname}")
-            with open(self.cache_fname, "rb") as source:
-                loaded_hash, loaded_structures = pickle.load(source)
-                codebase_matches_hash = loaded_hash == codebase_hash
-                if not codebase_matches_hash:
-                    logging.warning(
-                        "Mismatched hashes between codebase and cached values; updating cached values"
-                    )
+        elif use_cache:
+            # Try to load from expected cache file first
+            if os.path.exists(self.cache_fname):
+                logging.info(f"Loading cached full dataset from {self.cache_fname}")
+                with open(self.cache_fname, "rb") as source:
+                    loaded_hash, loaded_structures = pickle.load(source)
+                    codebase_matches_hash = loaded_hash == codebase_hash
+                    if not codebase_matches_hash:
+                        if force_use_cache:
+                            # NEW: Use cached data even if hash doesn't match (avoids expensive recomputation)
+                            logging.warning(
+                                "Mismatched hashes between codebase and cached values, but using cached data anyway "
+                                "(set force_use_cache=False to recompute). This is safe if only training code changed."
+                            )
+                            self.structures = loaded_structures
+                            codebase_matches_hash = True  # Mark as matched to avoid recomputation
+                        else:
+                            logging.warning(
+                                "Mismatched hashes between codebase and cached values; will recompute dataset"
+                            )
+                    else:
+                        self.structures = loaded_structures
+                        logging.info("Hash matches between codebase and cached values!")
+            elif force_use_cache:
+                # NEW: If expected cache file doesn't exist but force_use_cache=True,
+                # try to find and use any existing cache file for this dataset
+                if os.path.isdir(self.pdbs_src):
+                    k = os.path.basename(self.pdbs_src)
                 else:
-                    self.structures = loaded_structures
-                    logging.info("Hash matches between codebase and cached values!")
+                    k = self.pdbs_src
+                matches = glob.glob(
+                    os.path.join(self.cache_dir, f"cache_canonical_structures_{k}_*.pkl")
+                )
+                if matches:
+                    # Use the most recent cache file
+                    cache_file = max(matches, key=os.path.getmtime)
+                    logging.info(f"Expected cache file not found, but using existing cache: {cache_file}")
+                    try:
+                        with open(cache_file, "rb") as source:
+                            loaded_hash, loaded_structures = pickle.load(source)
+                            logging.warning(
+                                f"Using old cache file (hash mismatch expected). "
+                                f"This is safe if only training code changed."
+                            )
+                            self.structures = loaded_structures
+                            codebase_matches_hash = True  # Mark as matched to avoid recomputation
+                    except Exception as e:
+                        logging.warning(f"Failed to load existing cache file {cache_file}: {e}")
         # We have not yet populated self.structures
         if self.structures is None:
-            self.__clean_mismatched_caches()
+            # Only clean mismatched caches if we're not forcing use of cache
+            # (if force_use_cache=True, we want to keep old cache files)
+            if not force_use_cache:
+                self.__clean_mismatched_caches()
             self.structures = self.__compute_featurization(fnames)
             if use_cache and not codebase_matches_hash:
                 logging.info(f"Saving full dataset to cache at {self.cache_fname}")
@@ -173,6 +213,25 @@ class CathCanonicalAnglesDataset(Dataset):
             logging.info(
                 f"Removing structures shorter than {self.min_length} residues excludes {len_delta}/{orig_len} --> {len(self.structures)} sequences"
             )
+        
+        # BEST PRACTICE: Filter structures by quality (Ramachandran, clashes)
+        # Only apply during training to ensure high-quality training data
+        if split == "train" and len(self.structures) > 0:
+            try:
+                from foldingdiff.data_augmentation import filter_structures_by_quality
+                orig_len = len(self.structures)
+                self.structures, kept_indices = filter_structures_by_quality(
+                    self.structures,
+                    min_rama_favored=0.70,  # Keep only structures with >70% Ramachandran favored
+                    max_clash_rate=0.10     # Keep only structures with <10% clash rate
+                )
+                len_delta = orig_len - len(self.structures)
+                if len_delta > 0:
+                    logging.info(
+                        f"Quality filtering excluded {len_delta}/{orig_len} low-quality structures --> {len(self.structures)} high-quality sequences"
+                    )
+            except Exception as e:
+                logging.warning(f"Quality filtering failed: {e}, continuing without filtering")
         if self.trim_strategy == "discard":
             orig_len = len(self.structures)
             self.structures = [
@@ -246,7 +305,11 @@ class CathCanonicalAnglesDataset(Dataset):
         elif Path(pdbs).is_dir():
             fnames = []
             for ext in [".pdb", ".pdb.gz"]:
+                # Search in directory and recursively in subdirectories
                 fnames.extend(glob.glob(os.path.join(pdbs, f"*{ext}")))
+                fnames.extend(glob.glob(os.path.join(pdbs, "**", f"*{ext}"), recursive=True))
+            # Remove duplicates
+            fnames = list(set(fnames))
             assert fnames, f"No PDB files found in {pdbs}"
             logging.info(f"Found {len(fnames)} PDB files in {pdbs}")
         else:  # Should be a keyword
@@ -294,13 +357,17 @@ class CathCanonicalAnglesDataset(Dataset):
             os.path.join(self.cache_dir, f"cache_canonical_structures_{k}_*.pkl")
         )
         if not matches:
-            logging.info(
-                f"No cache files found matching {matches}, no cleaning necessary"
+            logging.debug(
+                f"No cache files found matching pattern for {k}, no cleaning necessary"
             )
+            return
         for fname in matches:
             if fname != self.cache_fname:
                 logging.info(f"Removing old cache file {fname}")
-                os.remove(fname)
+                try:
+                    os.remove(fname)
+                except Exception as e:
+                    logging.warning(f"Failed to remove old cache file {fname}: {e}")
 
     def __compute_featurization(
         self, fnames: Sequence[str]

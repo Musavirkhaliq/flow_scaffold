@@ -174,7 +174,8 @@ class BertForFlowMatchingTraining(BertForFlowMatching, pl.LightningModule):
             t = self.flow_schedule.sample_time(
                 batch_size, device, 
                 importance_weighting=True, 
-                alpha=2.0
+                alpha=2.0,
+                use_u_shaped=True  # NEW: U-shaped distribution for better rectified flows (2025 improvement)
             )
         
         # Sample noise

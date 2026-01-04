@@ -294,24 +294,37 @@ class PairwiseFeatureEmbedding(nn.Module):
         # Compute pairwise distances (CA-CA)
         ca_coords = coords[:, :, 1, :]  # [batch, seq_len, 3]
         
-        # Pairwise distance matrix
-        diff = ca_coords.unsqueeze(2) - ca_coords.unsqueeze(1)
-        # [batch, seq_len, seq_len, 3]
+        # MEMORY-EFFICIENT: Compute pairwise distances in chunks to avoid OOM
+        # Instead of [batch, seq_len, seq_len, hidden], compute per-residue
+        chunk_size = min(32, seq_len)  # Process 32 residues at a time
+        pairwise_features_list = []
         
-        distances = torch.norm(diff, dim=-1)  # [batch, seq_len, seq_len]
+        for i in range(0, seq_len, chunk_size):
+            end_i = min(i + chunk_size, seq_len)
+            ca_chunk = ca_coords[:, i:end_i, :]  # [batch, chunk_size, 3]
+            
+            # Compute distances from chunk to all residues
+            diff = ca_chunk.unsqueeze(2) - ca_coords.unsqueeze(1)  # [batch, chunk_size, seq_len, 3]
+            distances = torch.norm(diff, dim=-1)  # [batch, chunk_size, seq_len]
+            
+            # Bin distances
+            dist_bins = torch.bucketize(distances, self.dist_bins)
+            dist_bins = torch.clamp(dist_bins, 0, self.num_distance_bins - 1)
+            
+            # Embed distances (memory-efficient: only for chunk)
+            dist_emb = self.dist_embed(dist_bins)  # [batch, chunk_size, seq_len, hidden]
+            
+            # Apply attention mask if provided
+            if attn_mask is not None:
+                mask = attn_mask[:, i:end_i].unsqueeze(2) * attn_mask.unsqueeze(1)
+                dist_emb = dist_emb * mask.unsqueeze(-1)
+            
+            # Aggregate pairwise features (mean pooling over seq_len dimension)
+            chunk_features = dist_emb.mean(dim=2)  # [batch, chunk_size, hidden]
+            pairwise_features_list.append(chunk_features)
         
-        # Bin distances
-        dist_bins = torch.bucketize(distances, self.dist_bins)
-        dist_bins = torch.clamp(dist_bins, 0, self.num_distance_bins - 1)
-        dist_emb = self.dist_embed(dist_bins)  # [batch, seq_len, seq_len, hidden]
-        
-        # Apply attention mask if provided
-        if attn_mask is not None:
-            mask = attn_mask.unsqueeze(1) * attn_mask.unsqueeze(2)
-            dist_emb = dist_emb * mask.unsqueeze(-1)
-        
-        # Aggregate pairwise features (mean pooling)
-        pairwise_features = dist_emb.mean(dim=2)  # [batch, seq_len, hidden]
+        # Concatenate chunks
+        pairwise_features = torch.cat(pairwise_features_list, dim=1)  # [batch, seq_len, hidden]
         
         # Combine with node features
         combined = torch.cat([node_features, pairwise_features], dim=-1)

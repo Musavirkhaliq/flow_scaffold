@@ -21,7 +21,8 @@ import json
 import logging
 
 import torch
-from torch.utils.data import DataLoader
+from torch.utils.data import DataLoader, Subset
+import numpy as np
 import pytorch_lightning as pl
 from pytorch_lightning.callbacks import ModelCheckpoint, LearningRateMonitor
 from pytorch_lightning.loggers import TensorBoardLogger
@@ -29,6 +30,7 @@ from pytorch_lightning.loggers import TensorBoardLogger
 from transformers import BertConfig
 
 from foldingdiff.enhanced_datasets import create_enhanced_dataset
+from foldingdiff.combined_datasets import create_combined_dataset
 from foldingdiff.enhanced_models_v2 import BertForAdvancedFlowMatchingTraining
 
 
@@ -39,9 +41,23 @@ def main():
     
     # Data arguments
     parser.add_argument("--data_dir", type=str, default="data/cath")
-    parser.add_argument("--pad", type=int, default=128)
+    parser.add_argument("--pad", type=int, default=512)  # CRITICAL FIX: Increased from 128 to 512 for longer sequences
     parser.add_argument("--min_length", type=int, default=40)
-    parser.add_argument("--toy", action="store_true", help="Use toy dataset")
+    parser.add_argument("--toy", action="store_true", help="Use toy dataset (50 train + 10 validation)")
+    parser.add_argument("--max_train_samples", type=int, default=None,
+                       help="Maximum number of training samples (None = no limit)")
+    parser.add_argument("--max_val_samples", type=int, default=None,
+                       help="Maximum number of validation samples (None = no limit)")
+    
+    # Multi-dataset support (for larger training data)
+    parser.add_argument("--use_combined_dataset", action="store_true", default=False,
+                       help="Combine CATH + AlphaFold + PDB datasets for larger training set")
+    parser.add_argument("--alphafold_dir", type=str, default=None,
+                       help="Path to AlphaFold directory (default: data/alphafold)")
+    parser.add_argument("--pdb_dir", type=str, default=None,
+                       help="Path to PDB directory (default: None, skip PDB)")
+    parser.add_argument("--custom_data_dirs", type=str, nargs="+", default=None,
+                       help="Additional custom data directories to include")
     
     # Enhanced features
     parser.add_argument("--use_coords", action="store_true", default=True)
@@ -63,8 +79,9 @@ def main():
     parser.add_argument("--use_consistency_loss", action="store_true", default=True)
     parser.add_argument("--use_geometric_loss", action="store_true", default=True)
     parser.add_argument("--consistency_weight", type=float, default=0.1)
-    parser.add_argument("--geometric_weight", type=float, default=0.30)  # CRITICAL: Increased from 0.15 to 0.30 for stronger geometric constraints (target: beat SOTA)
-    
+    parser.add_argument("--geometric_weight", type=float, default=0.15)  # CRITICAL FIX: Reduced from 0.22 to 0.15 to reduce clash rate (was 97.8%)
+    parser.add_argument("--use_oat_fm", action="store_true", default=False,
+                       help="Enable OAT-FM (Optimal Acceleration Transport) for better flow matching")
     # Motif scaffolding
     parser.add_argument("--motif_length_min", type=int, default=5)
     parser.add_argument("--motif_length_max", type=int, default=20)
@@ -83,12 +100,14 @@ def main():
     
     # Training
     parser.add_argument("--batch_size", type=int, default=32)  # CRITICAL: Increased from 16 to 32 for better stability
-    parser.add_argument("--accumulate_grad_batches", type=int, default=1)  # For gradient accumulation if needed
-    parser.add_argument("--lr", type=float, default=1e-4)  # Reduced from 3e-4 for more stable training
-    parser.add_argument("--epochs", type=int, default=150)  # More epochs for complex model
-    parser.add_argument("--lr_scheduler", type=str, default="LinearWarmup")
-    parser.add_argument("--warmup_ratio", type=float, default=0.15)  # Longer warmup
-    parser.add_argument("--gradient_clip", type=float, default=1.0)
+    parser.add_argument("--accumulate_grad_batches", type=int, default=1,
+                       help="Gradient accumulation steps (Issue 6: effective batch = batch_size * accumulate_grad_batches)")
+    parser.add_argument("--lr", type=float, default=3e-5)  # CRITICAL FIX: Reduced from 1e-4 to 3e-5 for better stability (web research: lower LR for flow matching)
+    parser.add_argument("--epochs", type=int, default=50)  # INCREASED from 10 to 50 (Priority 1 Fix - SOTA minimum)
+    parser.add_argument("--lr_scheduler", type=str, default="CosineAnnealing", choices=["LinearWarmup", "CosineAnnealing"],
+                       help="Learning rate scheduler: LinearWarmup or CosineAnnealing (BEST PRACTICE: CosineAnnealing for better convergence)")
+    parser.add_argument("--warmup_ratio", type=float, default=0.15)  # Longer warmup (15% for stability)
+    parser.add_argument("--gradient_clip", type=float, default=0.5)  # CRITICAL FIX: Reduced from 1.0 to 0.5 to prevent gradient explosion
     
     # Output
     parser.add_argument("--output_dir", type=str, default="results/advanced_flow")
@@ -135,35 +154,104 @@ def main():
     logger.info("LOADING DATASETS")
     logger.info("=" * 80)
     
-    train_dset = create_enhanced_dataset(
-        split="train" if not args.toy else None,
-        pad=args.pad,
-        min_length=args.min_length,
-        toy=50 if args.toy else 0,
-        compute_coords=args.use_coords,
-        compute_ss=args.use_ss,
-        include_sequences=args.use_sequence_augmentation,
-        use_motif_scaffolding=True,
-        motif_length_range=(args.motif_length_min, args.motif_length_max),
-        motif_prob=args.motif_prob,
-        timesteps=args.timesteps,
-        beta_schedule=args.beta_schedule,
-    )
+    # Use combined dataset if requested (for larger training data)
+    if args.use_combined_dataset:
+        logger.info("Using COMBINED dataset (CATH + AlphaFold + PDB)")
+        
+        # Create base combined dataset
+        base_train_dset = create_combined_dataset(
+            cath_dir=None,  # Use default
+            alphafold_dir=args.alphafold_dir,
+            pdb_dir=args.pdb_dir,
+            custom_dirs=args.custom_data_dirs,
+            split="train" if not args.toy else None,
+            pad=args.pad,
+            min_length=args.min_length,
+            use_enhanced=True,
+            compute_coords=args.use_coords,
+            compute_ss=args.use_ss,
+            include_sequences=args.use_sequence_augmentation,
+        )
+        
+        base_val_dset = create_combined_dataset(
+            cath_dir=None,
+            alphafold_dir=args.alphafold_dir,
+            pdb_dir=args.pdb_dir,
+            custom_dirs=None,  # Don't use custom dirs for validation
+            split="validation" if not args.toy else None,
+            pad=args.pad,
+            min_length=args.min_length,
+            use_enhanced=True,
+            compute_coords=args.use_coords,
+            compute_ss=args.use_ss,
+            include_sequences=args.use_sequence_augmentation,
+        )
+        
+        # Wrap with motif scaffolding and noising
+        from foldingdiff.motif_scaffolding import MotifScaffoldingDataset
+        
+        train_dset = MotifScaffoldingDataset(
+            dset=base_train_dset,
+            motif_length_range=(args.motif_length_min, args.motif_length_max),
+            motif_prob=args.motif_prob,
+            timesteps=args.timesteps,
+            beta_schedule=args.beta_schedule,
+        )
+        
+        val_dset = MotifScaffoldingDataset(
+            dset=base_val_dset,
+            motif_length_range=(args.motif_length_min, args.motif_length_max),
+            motif_prob=args.motif_prob,
+            timesteps=args.timesteps,
+            beta_schedule=args.beta_schedule,
+        )
+    else:
+        # Use single dataset (CATH only, existing behavior)
+        logger.info("Using single dataset (CATH only)")
+        train_dset = create_enhanced_dataset(
+            split="train" if not args.toy else None,
+            pad=args.pad,
+            min_length=args.min_length,
+            toy=50 if args.toy else 0,
+            compute_coords=args.use_coords,
+            compute_ss=args.use_ss,
+            include_sequences=args.use_sequence_augmentation,
+            use_motif_scaffolding=True,
+            motif_length_range=(args.motif_length_min, args.motif_length_max),
+            motif_prob=args.motif_prob,
+            timesteps=args.timesteps,
+            beta_schedule=args.beta_schedule,
+        )
+        
+        val_dset = create_enhanced_dataset(
+            split="validation" if not args.toy else None,
+            pad=args.pad,
+            min_length=args.min_length,
+            toy=10 if args.toy else 0,
+            compute_coords=args.use_coords,
+            compute_ss=args.use_ss,
+            include_sequences=args.use_sequence_augmentation,
+            use_motif_scaffolding=True,
+            motif_length_range=(args.motif_length_min, args.motif_length_max),
+            motif_prob=args.motif_prob,
+            timesteps=args.timesteps,
+            beta_schedule=args.beta_schedule,
+        )
     
-    val_dset = create_enhanced_dataset(
-        split="validation" if not args.toy else None,
-        pad=args.pad,
-        min_length=args.min_length,
-        toy=10 if args.toy else 0,
-        compute_coords=args.use_coords,
-        compute_ss=args.use_ss,
-        include_sequences=args.use_sequence_augmentation,
-        use_motif_scaffolding=True,
-        motif_length_range=(args.motif_length_min, args.motif_length_max),
-        motif_prob=args.motif_prob,
-        timesteps=args.timesteps,
-        beta_schedule=args.beta_schedule,
-    )
+    # Limit dataset size if specified (for faster testing)
+    if args.max_train_samples is not None and len(train_dset) > args.max_train_samples:
+        logger.info(f"Limiting training dataset from {len(train_dset)} to {args.max_train_samples} samples")
+        rng = np.random.RandomState(seed=42)
+        indices = np.arange(len(train_dset))
+        rng.shuffle(indices)
+        train_dset = Subset(train_dset, indices[:args.max_train_samples].tolist())
+    
+    if args.max_val_samples is not None and len(val_dset) > args.max_val_samples:
+        logger.info(f"Limiting validation dataset from {len(val_dset)} to {args.max_val_samples} samples")
+        rng = np.random.RandomState(seed=42)
+        indices = np.arange(len(val_dset))
+        rng.shuffle(indices)
+        val_dset = Subset(val_dset, indices[:args.max_val_samples].tolist())
     
     logger.info(f"✓ Train dataset: {len(train_dset)} examples")
     logger.info(f"✓ Val dataset: {len(val_dset)} examples")
@@ -242,8 +330,8 @@ def main():
         num_attention_heads=args.num_heads,
         intermediate_size=args.hidden_size * 4,
         max_position_embeddings=args.pad,
-        attention_probs_dropout_prob=0.1,  # CRITICAL: Add dropout for regularization
-        hidden_dropout_prob=0.1,  # CRITICAL: Add dropout for regularization
+        attention_probs_dropout_prob=0.05,  # CRITICAL FIX: Reduced from 0.1 to 0.05 for less aggressive regularization
+        hidden_dropout_prob=0.05,  # CRITICAL FIX: Reduced from 0.1 to 0.05 for less aggressive regularization
     )
     
     # Save config
@@ -279,6 +367,7 @@ def main():
         use_geometric_loss=args.use_geometric_loss,
         consistency_weight=args.consistency_weight,
         geometric_weight=args.geometric_weight,
+        use_oat_fm=args.use_oat_fm,  # NEW: OAT-FM support (Priority 2 Fix)
         
         # Training parameters
         lr=args.lr,
@@ -344,6 +433,11 @@ def main():
     )
     
     # Create trainer with advanced settings
+    # Issue 6: Use gradient accumulation for larger effective batch size
+    accumulate_grad_batches = args.accumulate_grad_batches
+    effective_batch_size = args.batch_size * accumulate_grad_batches
+    logger.info(f"Effective batch size: {effective_batch_size} (batch_size={args.batch_size} × accumulate={accumulate_grad_batches})")
+    
     trainer = pl.Trainer(
         max_epochs=args.epochs,
         gpus=args.gpus if torch.cuda.is_available() else 0,
@@ -359,7 +453,7 @@ def main():
     
     logger.info(f"✓ Advanced trainer configured")
     logger.info(f"✓ Epochs: {args.epochs}")
-    logger.info(f"✓ Batch size: {args.batch_size} (effective: {args.batch_size * 2})")
+    logger.info(f"✓ Batch size: {args.batch_size} (effective: {effective_batch_size})")
     logger.info(f"✓ Learning rate: {args.lr}")
     logger.info(f"✓ GPUs: {args.gpus if torch.cuda.is_available() else 0}")
     

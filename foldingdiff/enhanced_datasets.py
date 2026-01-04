@@ -48,8 +48,11 @@ class EnhancedCathDataset(CathCanonicalAnglesOnlyDataset):
         compute_coords: bool = True,
         compute_ss: bool = True,
         include_sequences: bool = False,
+        force_use_cache: bool = True,  # NEW: Use cached data even if codebase hash doesn't match
         **kwargs
     ):
+        # Pass force_use_cache to parent class
+        kwargs['force_use_cache'] = force_use_cache
         super().__init__(**kwargs)
         self.compute_coords = compute_coords
         self.compute_ss = compute_ss
@@ -192,6 +195,7 @@ def create_enhanced_dataset(
     motif_prob: float = 0.8,
     timesteps: int = 1000,
     beta_schedule: str = "cosine",
+    force_use_cache: bool = True,  # NEW: Use cached data even if codebase hash doesn't match
 ) -> Union[EnhancedCathDataset, EnhancedMotifScaffoldingDataset]:
     """
     Factory function to create enhanced datasets.
@@ -223,6 +227,7 @@ def create_enhanced_dataset(
         compute_coords=compute_coords,
         compute_ss=compute_ss,
         include_sequences=include_sequences,
+        force_use_cache=force_use_cache,  # NEW: Pass through force_use_cache
     )
     
     # Optionally wrap with motif scaffolding
