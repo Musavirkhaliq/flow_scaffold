@@ -101,17 +101,29 @@ elif [ "$DATASET_SIZE" = "medium" ]; then
     echo "  - Good for moderate testing before full training"
 else
     echo "  - FULL MODE: Using complete dataset (no limits)"
-    echo "  - Using COMBINED dataset (CATH + AlphaFold)"
-    echo "  - CATH directory: ${CATH_DIR}"
-    echo "  - AlphaFold directory: ${ALPHAFOLD_DIR}"
+    if [ "$USE_COMBINED_DATASET" = true ]; then
+        echo "  - Using COMBINED dataset (CATH + AlphaFold)"
+        echo "  - CATH directory: ${CATH_DIR}"
+        echo "  - AlphaFold directory: ${ALPHAFOLD_DIR}"
+    else
+        echo "  - Using CATH dataset only"
+        echo "  - CATH directory: ${CATH_DIR}"
+    fi
 fi
 echo ""
 
-# Build training command with combined dataset (CATH + AlphaFold)
+# Build training command
 TRAIN_CMD="python bin/train_advanced_flow.py \
-    --data_dir ${CATH_DIR} \
+    --data_dir ${CATH_DIR}"
+
+# Add combined dataset flags only if USE_COMBINED_DATASET is true
+if [ "$USE_COMBINED_DATASET" = true ]; then
+    TRAIN_CMD="${TRAIN_CMD} \
     --use_combined_dataset \
-    --alphafold_dir ${ALPHAFOLD_DIR} \
+    --alphafold_dir ${ALPHAFOLD_DIR}"
+fi
+
+TRAIN_CMD="${TRAIN_CMD} \
     --pad 512 \
     --min_length 40 \
     --motif_length_min ${MOTIF_MIN} \
@@ -231,10 +243,14 @@ echo "  ✓ Loss weights: consistency=${CONSISTENCY_WEIGHT}, geometric=${GEOMETR
 echo "  ✓ NEW: Enhanced geometric loss with clash penalty (0.3 weight, Priority 1)"
 echo "  ✓ NEW: Strengthened Ramachandran loss (3.0-5.0x penalty, Priority 1)"
 echo "  ✓ NEW: Pairwise distance loss (0.1-0.15 weight, Priority 1)"
-echo "  ✓ NEW: EMA (Exponential Moving Average) for model stability (Priority 2)"
-echo "  ✓ NEW: OAT-FM support (${USE_OAT_FM}, Priority 2 - Optional)"
-echo "  ✓ Combined dataset: CATH + AlphaFold (82K+ structures vs 27K)"
-echo "  ✓ 80-10-10 split: Proper train/val/test separation"
+echo "    ✓ NEW: EMA (Exponential Moving Average) for model stability (Priority 2)"
+  echo "  ✓ NEW: OAT-FM support (${USE_OAT_FM}, Priority 2 - Optional)"
+  if [ "$USE_COMBINED_DATASET" = true ]; then
+    echo "  ✓ Combined dataset: CATH + AlphaFold (82K+ structures vs 27K)"
+  else
+    echo "  ✓ Dataset: CATH only"
+  fi
+  echo "  ✓ 80-10-10 split: Proper train/val/test separation"
 echo "  ✓ All advanced features enabled: sequence augmentation, geometric inverse design, multi-scale"
 echo ""
 
