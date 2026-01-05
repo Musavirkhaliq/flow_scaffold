@@ -51,7 +51,7 @@ echo "  - Epochs: ${EPOCHS} (INCREASED from 10 to 50 - Priority 1 Fix for SOTA c
 echo "  - Batch size: ${BATCH_SIZE}"
 echo "  - Gradient accumulation: ${ACCUMULATE_GRAD_BATCHES} (effective batch: $((BATCH_SIZE * ACCUMULATE_GRAD_BATCHES)))"
 echo "  - Learning rate: ${LR} (SOTA: Optimized with warmup)"
-echo "  - LR scheduler: ${LR_SCHEDULER} (SOTA: Cosine annealing for best convergence)"
+echo "  - LR scheduler: ${LR_SCHEDULER} (SOTA: Optimized for convergence)"
 echo "  - Warmup ratio: ${WARMUP_RATIO} (SOTA: 10% warmup for stable start)"
 echo "  - Hidden size: ${HIDDEN_SIZE} (SOTA: Increased capacity for better representation)"
 echo "  - Num layers: ${NUM_LAYERS} (SOTA: Deeper network for better capacity)"

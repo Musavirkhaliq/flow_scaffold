@@ -797,8 +797,8 @@ def compute_angular_flow_matching_loss(
             
             # BEST PRACTICE: Feature-specific loss weighting
             # Omega (index 2) needs higher weight for trans preference
-            # Feature weights: phi=1.0, psi=1.0, omega=2.0, tau=1.0, CA:C:1N=1.0, C:1N:1CA=1.0
-            feature_weights = [1.0, 1.0, 2.0, 1.0, 1.0, 1.0]  # omega gets 2.0x weight (increased from 1.5)
+            # Feature weights: phi=1.0, psi=1.0, omega=3.0, tau=1.0, CA:C:1N=1.0, C:1N:1CA=1.0
+            feature_weights = [1.0, 1.0, 3.0, 1.0, 1.0, 1.0]  # omega gets 3.0x weight (increased from 2.0 for stronger trans preference)
             if i < len(feature_weights):
                 loss_per_element = loss_per_element * feature_weights[i]
         else:

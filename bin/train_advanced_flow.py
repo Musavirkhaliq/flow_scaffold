@@ -79,7 +79,7 @@ def main():
     parser.add_argument("--use_consistency_loss", action="store_true", default=True)
     parser.add_argument("--use_geometric_loss", action="store_true", default=True)
     parser.add_argument("--consistency_weight", type=float, default=0.1)
-    parser.add_argument("--geometric_weight", type=float, default=0.15)  # CRITICAL FIX: Reduced from 0.22 to 0.15 to reduce clash rate (was 97.8%)
+    parser.add_argument("--geometric_weight", type=float, default=0.20)  # CRITICAL: Match config_advanced_flow.sh (GEOMETRIC_WEIGHT=0.20)
     parser.add_argument("--use_oat_fm", action="store_true", default=False,
                        help="Enable OAT-FM (Optimal Acceleration Transport) for better flow matching")
     # Motif scaffolding
@@ -99,13 +99,13 @@ def main():
     parser.add_argument("--beta_schedule", type=str, default="cosine")
     
     # Training
-    parser.add_argument("--batch_size", type=int, default=32)  # CRITICAL: Increased from 16 to 32 for better stability
-    parser.add_argument("--accumulate_grad_batches", type=int, default=1,
-                       help="Gradient accumulation steps (Issue 6: effective batch = batch_size * accumulate_grad_batches)")
-    parser.add_argument("--lr", type=float, default=3e-5)  # CRITICAL FIX: Reduced from 1e-4 to 3e-5 for better stability (web research: lower LR for flow matching)
-    parser.add_argument("--epochs", type=int, default=50)  # INCREASED from 10 to 50 (Priority 1 Fix - SOTA minimum)
-    parser.add_argument("--lr_scheduler", type=str, default="CosineAnnealing", choices=["LinearWarmup", "CosineAnnealing"],
-                       help="Learning rate scheduler: LinearWarmup or CosineAnnealing (BEST PRACTICE: CosineAnnealing for better convergence)")
+    parser.add_argument("--batch_size", type=int, default=16)  # CRITICAL: Match config_advanced_flow.sh (BATCH_SIZE=16)
+    parser.add_argument("--accumulate_grad_batches", type=int, default=2,
+                       help="Gradient accumulation steps (CRITICAL: Match config_advanced_flow.sh - effective batch = batch_size * accumulate_grad_batches)")
+    parser.add_argument("--lr", type=float, default=2e-5)  # CRITICAL FIX: Reduced from 3e-5 to 2e-5 to handle gradient norms 15-32 and improve stability
+    parser.add_argument("--epochs", type=int, default=150)  # CRITICAL: Match config_advanced_flow.sh (EPOCHS=150)
+    parser.add_argument("--lr_scheduler", type=str, default="ReduceLROnPlateau", choices=["LinearWarmup", "CosineAnnealing", "ReduceLROnPlateau"],
+                       help="Learning rate scheduler: LinearWarmup, CosineAnnealing, or ReduceLROnPlateau (CRITICAL: Match config_advanced_flow.sh - ReduceLROnPlateau adapts to validation loss plateaus)")
     parser.add_argument("--warmup_ratio", type=float, default=0.15)  # Longer warmup (15% for stability)
     parser.add_argument("--gradient_clip", type=float, default=0.5)  # CRITICAL FIX: Reduced from 1.0 to 0.5 to prevent gradient explosion
     

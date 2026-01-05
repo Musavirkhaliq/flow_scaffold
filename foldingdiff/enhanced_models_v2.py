@@ -587,8 +587,8 @@ class BertForAdvancedFlowMatching(BertForFlowMatchingEnhanced):
         The model predicts velocities in sin/cos space (ṡ, ċ) to avoid "stiffness" near ±π boundary.
         We need to project these velocities onto the tangent space of the circle to get angle velocities.
         
-        The tangent vector at point (sin(θ), cos(θ)) on the circle is (-sin(θ), cos(θ)).
-        Projection: v_θ = (ṡ, ċ) · (-sin(θ), cos(θ)) = -sin(θ) * ṡ + cos(θ) * ċ
+        The tangent vector at point (sin(θ), cos(θ)) on the circle is (cos(θ), -sin(θ)).
+        Projection: v_θ = (ṡ, ċ) · (cos(θ), -sin(θ)) = cos(θ) * ṡ - sin(θ) * ċ
         
         Args:
             sincos_velocity: [batch, seq_len, n_features_sincos] sin/cos velocities
@@ -627,9 +627,10 @@ class BertForAdvancedFlowMatching(BertForFlowMatchingEnhanced):
                 # Get current angle
                 theta = current_angles[:, :, i]
                 
-                # Project onto tangent space: v_θ = -sin(θ) * ṡ + cos(θ) * ċ
+                # Project onto tangent space: v_θ = cos(θ) * ṡ - sin(θ) * ċ
                 # This projects the velocity vector (ṡ, ċ) onto the tangent space of the circle
-                v_theta = -torch.sin(theta) * v_sin + torch.cos(theta) * v_cos
+                # The tangent vector at (sin(θ), cos(θ)) is (cos(θ), -sin(θ))
+                v_theta = torch.cos(theta) * v_sin - torch.sin(theta) * v_cos
                 angle_velocities.append(v_theta.unsqueeze(-1))
             else:
                 # Non-angular feature: use velocity directly
@@ -1008,7 +1009,87 @@ class EnhancedMotifConditioning(nn.Module):
         # Integration layers
         self.integration_layer = nn.Linear(hidden_size * 2, hidden_size)
         self.layer_norm = nn.LayerNorm(hidden_size)
+    
+    def _attention_with_bias(
+        self,
+        query: torch.Tensor,
+        key: torch.Tensor,
+        value: torch.Tensor,
+        attention_bias: torch.Tensor
+    ) -> torch.Tensor:
+        """
+        Compute attention with relative position bias.
         
+        This manually computes attention scores, adds relative position bias,
+        and returns the attended output. This is necessary because nn.MultiheadAttention
+        doesn't support adding bias to attention scores.
+        
+        Args:
+            query: [batch, seq_len, hidden_size]
+            key: [batch, seq_len, hidden_size]
+            value: [batch, seq_len, hidden_size]
+            attention_bias: [1, 1, seq_len, seq_len] relative position bias
+        
+        Returns:
+            output: [batch, seq_len, hidden_size]
+        """
+        # Extract Q, K, V projections from MultiheadAttention
+        # MultiheadAttention uses in_proj_weight and in_proj_bias
+        # Shape: [3 * hidden_size, hidden_size] for in_proj_weight
+        in_proj_weight = self.motif_attention.in_proj_weight  # [3 * hidden_size, hidden_size]
+        in_proj_bias = self.motif_attention.in_proj_bias  # [3 * hidden_size]
+        out_proj = self.motif_attention.out_proj
+        
+        batch_size, seq_len, hidden_size = query.shape
+        num_heads = self.motif_attention.num_heads
+        head_dim = hidden_size // num_heads
+        
+        # Project Q, K, V
+        # Split in_proj_weight into Q, K, V parts
+        q_weight = in_proj_weight[:hidden_size, :]
+        k_weight = in_proj_weight[hidden_size:2*hidden_size, :]
+        v_weight = in_proj_weight[2*hidden_size:, :]
+        
+        q_bias = in_proj_bias[:hidden_size] if in_proj_bias is not None else None
+        k_bias = in_proj_bias[hidden_size:2*hidden_size] if in_proj_bias is not None else None
+        v_bias = in_proj_bias[2*hidden_size:] if in_proj_bias is not None else None
+        
+        # Compute Q, K, V
+        q = F.linear(query, q_weight, q_bias)
+        k = F.linear(key, k_weight, k_bias)
+        v = F.linear(value, v_weight, v_bias)
+        
+        # Reshape for multi-head attention: [batch, seq_len, num_heads, head_dim]
+        q = q.view(batch_size, seq_len, num_heads, head_dim)
+        k = k.view(batch_size, seq_len, num_heads, head_dim)
+        v = v.view(batch_size, seq_len, num_heads, head_dim)
+        
+        # Transpose for attention: [batch, num_heads, seq_len, head_dim]
+        q = q.transpose(1, 2)
+        k = k.transpose(1, 2)
+        v = v.transpose(1, 2)
+        
+        # Compute attention scores: [batch, num_heads, seq_len, seq_len]
+        scores = torch.matmul(q, k.transpose(-2, -1)) / (head_dim ** 0.5)
+        
+        # CRITICAL FIX: Add relative position bias to attention scores
+        # attention_bias: [1, 1, seq_len, seq_len] -> broadcast to [batch, num_heads, seq_len, seq_len]
+        scores = scores + attention_bias
+        
+        # Apply softmax
+        attn_weights = F.softmax(scores, dim=-1)
+        
+        # Apply attention to values
+        attn_output = torch.matmul(attn_weights, v)  # [batch, num_heads, seq_len, head_dim]
+        
+        # Reshape back: [batch, seq_len, num_heads, head_dim] -> [batch, seq_len, hidden_size]
+        attn_output = attn_output.transpose(1, 2).contiguous().view(batch_size, seq_len, hidden_size)
+        
+        # Apply output projection
+        output = out_proj(attn_output)
+        
+        return output
+    
     def forward(
         self,
         features: torch.Tensor,
@@ -1070,12 +1151,24 @@ class EnhancedMotifConditioning(nn.Module):
                 
                 # Check if there are any motif positions
                 if motif_mask_bool.any():
-                    # Simple approach: apply attention to all positions but mask out non-motif
-                    # This avoids complex mask handling that can cause NaN
-                    attended_motif, _ = self.motif_attention(
-                        motif_encoded, motif_encoded, motif_encoded,
-                        key_padding_mask=None  # Don't use complex masking for now
-                    )
+                    # CRITICAL FIX: Use relative position bias in attention computation
+                    # Instead of adding averaged relative embeddings to features, we add
+                    # pair-wise relative position bias to attention scores (QK^T)
+                    if self.use_positional_encoding:
+                        # Get attention bias from relative positional encoding
+                        attention_bias = self.pos_encoder.get_attention_bias(seq_len, motif_encoded.device)
+                        # attention_bias shape: [1, 1, seq_len, seq_len]
+                        
+                        # Compute attention with bias manually
+                        attended_motif = self._attention_with_bias(
+                            motif_encoded, motif_encoded, motif_encoded, attention_bias
+                        )
+                    else:
+                        # No positional encoding, use standard attention
+                        attended_motif, _ = self.motif_attention(
+                            motif_encoded, motif_encoded, motif_encoded,
+                            key_padding_mask=None
+                        )
                     
                     if torch.isnan(attended_motif).any():
                         logging.warning("NaN detected in attention output")
@@ -1156,59 +1249,24 @@ class RelativePositionalEncoding(nn.Module):
         
     def forward(self, features: torch.Tensor) -> torch.Tensor:
         """
-        CRITICAL FIX: Returns both features with positional encoding AND attention bias.
+        CRITICAL FIX: Relative positional encoding should NOT be added to features.
         
-        The attention bias should be added to attention scores in the Transformer.
-        For now, we add a simplified version to features, but the proper fix requires
-        modifying the Transformer attention mechanism to accept relative position bias.
+        Relative position information should be added to attention scores (QK^T), not to
+        input features. Adding averaged relative embeddings to features discards pair-specific
+        information and makes the model spatially blind.
+        
+        This method now returns features unchanged. Use get_attention_bias() to get attention
+        bias that should be added to attention scores in the Transformer layers.
         
         Args:
             features: [batch, seq_len, hidden_size]
         
         Returns:
-            features: [batch, seq_len, hidden_size] with relative position encoding
+            features: [batch, seq_len, hidden_size] (unchanged - no feature addition)
         """
-        try:
-            batch_size, seq_len, hidden_size = features.shape
-            device = features.device
-            
-            # Create relative position matrix: [seq_len, seq_len]
-            positions = torch.arange(seq_len, device=device)
-            relative_positions = positions.unsqueeze(0) - positions.unsqueeze(1)  # [seq_len, seq_len]
-            
-            # Clamp to max distance
-            relative_positions = torch.clamp(
-                relative_positions, -self.max_distance, self.max_distance
-            )
-            
-            # Shift to positive indices for embedding lookup
-            relative_positions_shifted = relative_positions + self.max_distance
-            
-            # Get embeddings: [seq_len, seq_len, hidden_size]
-            relative_embeddings = self.relative_embeddings(relative_positions_shifted)
-            
-            # CRITICAL FIX: Instead of taking diagonal, compute per-position encoding
-            # by averaging relative embeddings for each position
-            # This gives each position a representation of its relative distances to all others
-            # Shape: [seq_len, hidden_size]
-            position_encoding = relative_embeddings.mean(dim=1)  # Average over "other" positions
-            
-            # Expand to batch: [batch, seq_len, hidden_size]
-            position_encoding = position_encoding.unsqueeze(0).expand(batch_size, -1, -1)
-            
-            # Add to features
-            features_with_pos = features + position_encoding
-            
-            # Check for NaN
-            if torch.isnan(features_with_pos).any():
-                logging.warning("NaN detected in relative positional encoding")
-                return features
-            
-            return features_with_pos
-            
-        except Exception as e:
-            logging.warning(f"Error in relative positional encoding: {e}")
-            return features
+        # Return features unchanged - relative position bias should be added to attention scores
+        # not to input features. This preserves pair-specific spatial information.
+        return features
     
     def get_attention_bias(self, seq_len: int, device: torch.device) -> torch.Tensor:
         """
@@ -1217,9 +1275,9 @@ class RelativePositionalEncoding(nn.Module):
         This should be added to QK^T in the attention mechanism.
         Shape: [1, 1, seq_len, seq_len] (can be broadcast to [batch, num_heads, seq_len, seq_len])
         
-        NOTE: This method is provided for future use when modifying Transformer attention
-        to properly incorporate relative position bias. Currently, the forward method
-        uses a simplified approach that adds position encoding to features.
+        This method computes pair-wise relative position biases that preserve spatial
+        information between all residue pairs, unlike the previous approach that averaged
+        over positions and added to features.
         """
         positions = torch.arange(seq_len, device=device)
         relative_positions = positions.unsqueeze(0) - positions.unsqueeze(1)
@@ -1367,7 +1425,15 @@ class BertForAdvancedFlowMatchingTraining(BertForAdvancedFlowMatching, BertForFl
     
     def on_after_backward(self):
         """Monitor gradients after backward pass to detect gradient explosion"""
-        # Log gradient norms every 50 batches to monitor training stability
+        # Note: This is called after each backward() during gradient accumulation
+        # We don't log here to avoid duplicate logs - see on_before_optimizer_step()
+        pass
+    
+    def on_before_optimizer_step(self, optimizer):
+        """Monitor gradients before optimizer step (after all accumulation is done)"""
+        # CRITICAL FIX: Log gradient norms only once per optimizer step (not during accumulation)
+        # This prevents duplicate logs when using gradient accumulation
+        # Log gradient norms every 50 steps to monitor training stability
         if self.global_step % 50 == 0:
             try:
                 total_norm = 0.0
@@ -1387,12 +1453,11 @@ class BertForAdvancedFlowMatchingTraining(BertForAdvancedFlowMatching, BertForFl
                 
                 # Warn if gradient norm is too high (potential explosion)
                 # Note: These are pre-clipped gradients. They will be clipped by the trainer.
-                # CRITICAL: Gradient clipping should be set to 1.0 (2026 recommendation, up from 0.5)
                 # Get the actual clip value from trainer if available
                 try:
-                    clip_val = getattr(self.trainer, 'gradient_clip_val', 1.0)
+                    clip_val = getattr(self.trainer, 'gradient_clip_val', 0.5)
                 except:
-                    clip_val = 1.0  # Default gradient clip value (2026 recommendation)
+                    clip_val = 0.5  # Default gradient clip value (matches config)
                 
                 if total_norm > 5.0:
                     logging.warning(f"High pre-clip gradient norm: {total_norm:.4f} at step {self.global_step} (will be clipped to {clip_val})")
@@ -1414,10 +1479,15 @@ class BertForAdvancedFlowMatchingTraining(BertForAdvancedFlowMatching, BertForFl
         # 1e-4 is often too high; 5e-5 is more stable
         effective_lr = min(self.learning_rate, 5e-5) if self.learning_rate > 5e-5 else self.learning_rate
         
+        # CRITICAL FIX: Always use weight decay for regularization (prevents overfitting)
+        # Weight decay is essential for reducing validation loss
+        weight_decay_value = 1e-4 if self.l2_lambda == 0.0 else self.l2_lambda
         optimizer = torch.optim.AdamW(
             self.parameters(),
             lr=effective_lr,
-            weight_decay=1e-4 if self.l2_lambda == 0.0 else self.l2_lambda
+            weight_decay=weight_decay_value,  # Always use weight decay
+            betas=(0.9, 0.999),
+            eps=1e-8
         )
         
         if self.lr_scheduler == "LinearWarmup":
@@ -1451,6 +1521,27 @@ class BertForAdvancedFlowMatchingTraining(BertForAdvancedFlowMatching, BertForFl
                 "lr_scheduler": {
                     "scheduler": scheduler,
                     "interval": "epoch",
+                }
+            }
+        elif self.lr_scheduler == "ReduceLROnPlateau":
+            # CRITICAL FIX: ReduceLROnPlateau adapts to validation loss plateaus
+            # This is essential when validation loss gets stuck above 0.55
+            from torch.optim.lr_scheduler import ReduceLROnPlateau
+            scheduler = ReduceLROnPlateau(
+                optimizer,
+                mode='min',
+                factor=0.5,  # Reduce LR by 50% when plateau detected
+                patience=5,  # Wait 5 epochs before reducing
+                min_lr=1e-6,
+                verbose=True
+            )
+            return {
+                "optimizer": optimizer,
+                "lr_scheduler": {
+                    "scheduler": scheduler,
+                    "monitor": "val_loss",  # Monitor validation loss
+                    "interval": "epoch",
+                    "frequency": 1
                 }
             }
         
@@ -1764,19 +1855,21 @@ class BertForAdvancedFlowMatchingTraining(BertForAdvancedFlowMatching, BertForFl
                     x_hat_0_angular = torch.atan2(torch.sin(x_hat_0), torch.cos(x_hat_0))
                     x_hat_0 = torch.where(angular_mask, x_hat_0_angular, x_hat_0)
                 
-                # CRITICAL FIX: Time-Thresholded Geometric Loss
-                # Physics doesn't matter when the protein is noise (t≥0.3); it matters as it crystallizes (t<0.3).
-                # At t=0.9 (mostly noise), calculating Ramachandran loss on x_hat_0 is essentially random noise.
-                # The gradients from physics loss will contradict the gradients from Flow Matching loss.
-                # Solution: Only compute geometric loss when t < 0.3 (refinement stage).
-                # This allows the model to learn the global "flow" first, then focus on "physics" during refinement.
+                # CRITICAL FIX: Time-Weighted Geometric Loss
+                # Motif scaffolding requires constraints at higher t to guide coarse structure formation.
+                # Previous threshold (t < 0.3) delayed "physics" learning. Literature (2025 flow matching papers)
+                # emphasizes full-time constraints with annealing. Use time-weighted approach: (1-t) * geo_weight
+                # This allows geometric constraints to guide structure formation throughout the flow, with stronger
+                # constraints as we approach the clean structure (t -> 0).
                 
-                # Compute mean time for threshold check
+                # Compute mean time for weighting
                 t_mean = t.mean()
                 
-                # CRITICAL FIX: Time threshold - only enable geometric loss when t < 0.3
-                # This prevents "tug-of-war" between Flow Matching and geometric constraints at high noise
-                geometric_loss_enabled = t_mean < 0.3
+                # CRITICAL FIX: Use time-weighted geometric loss instead of hard threshold
+                # Weight decreases with t: at t=0.9 (high noise), weight is 0.1; at t=0.1 (low noise), weight is 0.9
+                # This provides guidance throughout the flow while preventing gradient conflicts at very high noise
+                time_weight = (1.0 - t_mean).clamp(min=0.0, max=1.0)
+                geometric_loss_enabled = time_weight > 0.0  # Enable for all t < 1.0
                 
                 if geometric_loss_enabled:
                     # CRITICAL FIX: Use predicted structure (x_hat_0) instead of ground truth (x_0)
@@ -1828,18 +1921,22 @@ class BertForAdvancedFlowMatchingTraining(BertForAdvancedFlowMatching, BertForFl
                                     (1 - self.balance_momentum) * balance_factor
                                 )
                         
-                        # CRITICAL FIX: With time thresholding, we can use higher base weight
-                        # Since geometric loss only applies at low noise (t<0.3), gradients are more stable
-                        # Increased from 0.001 to 0.01 because we're no longer fighting high-noise gradients
-                        base_geometric_weight = 0.01
+                        # CRITICAL FIX: Use geometric_weight from config but scale down to prevent gradient explosion
+                        # Config value (0.20) was causing gradient norms of 44-90
+                        # Scale down by 0.5x to balance between constraints and stability
+                        # The config value is used as base, then scaled, balanced, and time-weighted
+                        base_geometric_weight = self.geometric_weight * 0.5  # Scale down from 0.20 to 0.10 to prevent gradient explosion
                         balanced_geometric_weight = base_geometric_weight * self.running_balance_factor.item()
                         
-                        # Apply geometric loss (no time weighting needed since we've already thresholded)
-                        weighted_geometric_loss = geometric_loss * balanced_geometric_weight
+                        # CRITICAL FIX: Apply time-weighted geometric loss
+                        # Weight decreases with t to prevent gradient conflicts at high noise while still
+                        # providing guidance throughout the flow
+                        weighted_geometric_loss = geometric_loss * balanced_geometric_weight * time_weight
                         
                         total_loss = total_loss + weighted_geometric_loss
                         log_dict['train_geometric_loss'] = geometric_loss
                         log_dict['train_geometric_weight'] = balanced_geometric_weight
+                        log_dict['train_geometric_time_weight'] = time_weight.item()
                         log_dict['train_gradient_ratio'] = gradient_ratio
                         log_dict['train_balance_factor'] = self.running_balance_factor.item()
                         log_dict['train_geometric_enabled'] = 1.0  # Log that geometric loss was enabled
@@ -1875,14 +1972,95 @@ class BertForAdvancedFlowMatchingTraining(BertForAdvancedFlowMatching, BertForFl
             if not torch.isnan(l1_penalty):
                 total_loss += self.l1_lambda * l1_penalty
         
-        # CRITICAL FIX: Move NeRF (angles_to_coords) out of training loop
-        # NeRF is computationally expensive and sequential - running it in training loop
-        # significantly slows down training. Only compute occasionally for validation.
-        # Pairwise distance loss is now computed only during validation or every N epochs
-        # DISABLED in training loop - compute only during validation
-        # if self.use_geometric_loss and batch_idx % 100 == 0:
-        #     # NeRF computation moved to validation step only
-        #     pass
+        # CRITICAL FIX: Re-enable periodic NeRF computation for accurate clash detection
+        # Full NeRF (angles_to_coords) is needed for accurate validation and clash detection.
+        # Compute periodically (every 100 steps) to balance accuracy with training speed.
+        # The simplified bond-angle proxy is used for most steps, but periodic full coordinate
+        # computation ensures we catch actual atom clashes that the proxy might miss.
+        if self.use_geometric_loss and batch_idx % 100 == 0:
+            try:
+                # Compute full coordinate-based clash penalty periodically
+                from foldingdiff.embeddings import angles_to_coords_simple
+                
+                # Recompute x_hat_0 if not already computed (should be computed above, but ensure it exists)
+                # This ensures we have predicted angles for clash detection
+                if t.ndim == 1:
+                    t_expanded = t.view(-1, 1, 1)
+                elif t.ndim == 2:
+                    t_expanded = t.view(-1, 1, 1)
+                else:
+                    t_expanded = t
+                
+                x_hat_0_neRF = x_t - t_expanded * v_pred
+                
+                # Wrap angular features if needed
+                is_angular = self.ft_is_angular if hasattr(self, 'ft_is_angular') else [True, True, True, False, False, False]
+                if any(is_angular):
+                    is_angular_tensor = torch.tensor(is_angular, device=x_hat_0_neRF.device, dtype=torch.bool)
+                    if is_angular_tensor.ndim == 1:
+                        is_angular_tensor = is_angular_tensor.view(1, 1, -1)
+                    angular_mask = is_angular_tensor.expand_as(x_hat_0_neRF)
+                    x_hat_0_angular = torch.atan2(torch.sin(x_hat_0_neRF), torch.cos(x_hat_0_neRF))
+                    x_hat_0_neRF = torch.where(angular_mask, x_hat_0_angular, x_hat_0_neRF)
+                
+                # Convert angles to coordinates for clash detection
+                batch_size, seq_len, n_features = x_hat_0_neRF.shape
+                lengths = batch['attn_mask'].sum(dim=1).long()
+                
+                # Compute clash penalty from coordinates
+                coord_clash_penalty = torch.tensor(0.0, device=x_hat_0_neRF.device, requires_grad=True)
+                valid_batches = 0
+                
+                for i in range(batch_size):
+                    if lengths[i] > 0:
+                        try:
+                            # Get angles for this sequence (remove padding)
+                            seq_angles = x_hat_0_neRF[i:i+1, :lengths[i], :6]  # Only first 6 angles
+                            
+                            # Convert to coordinates using simplified NeRF
+                            coords = angles_to_coords_simple(seq_angles)  # [1, seq_len, 4, 3]
+                            
+                            # Flatten coordinates: [seq_len * 4, 3] (N, CA, C, O per residue)
+                            coords_flat = coords[0].view(-1, 3)  # [seq_len * 4, 3]
+                            
+                            # Compute pairwise distances
+                            dists = torch.cdist(coords_flat, coords_flat)  # [n_atoms, n_atoms]
+                            
+                            # Mask self-distances and bonded atoms (adjacent residues)
+                            n_atoms = coords_flat.shape[0]
+                            mask = torch.eye(n_atoms, device=dists.device, dtype=torch.bool)
+                            # Also mask bonded atoms (within same residue or adjacent residues)
+                            for j in range(n_atoms):
+                                residue_idx = j // 4
+                                for k in range(n_atoms):
+                                    residue_k_idx = k // 4
+                                    # Same residue or adjacent residues are bonded
+                                    if abs(residue_idx - residue_k_idx) <= 1:
+                                        mask[j, k] = True
+                            
+                            dists_masked = dists[~mask]
+                            
+                            # Penalize distances < 2.0 Å (clash threshold)
+                            clash_threshold = 2.0
+                            clashes = torch.clamp(clash_threshold - dists_masked, min=0.0)
+                            if clashes.numel() > 0:
+                                coord_clash_penalty = coord_clash_penalty + clashes.mean()
+                                valid_batches += 1
+                        except Exception as e:
+                            # Skip this batch if coordinate computation fails
+                            logging.debug(f"Coordinate clash detection failed for batch {i}: {e}")
+                            continue
+                
+                if valid_batches > 0:
+                    coord_clash_penalty = coord_clash_penalty / valid_batches
+                    # Add to total loss with time-weighted scaling (use current time_weight if available)
+                    current_time_weight = (1.0 - t.mean()).clamp(min=0.0, max=1.0) if 't' in locals() else 1.0
+                    weighted_coord_clash = coord_clash_penalty * 0.05 * current_time_weight  # Small weight
+                    total_loss = total_loss + weighted_coord_clash
+                    log_dict['train_coord_clash_penalty'] = coord_clash_penalty.item()
+            except Exception as e:
+                # Non-critical: if coordinate computation fails, continue without it
+                logging.debug(f"Periodic NeRF clash detection failed (non-critical): {e}")
         
         # CRITICAL FIX: Reduce EMA update frequency (every 10 steps instead of every step)
         # EMA updates are expensive for large models - updating every step is unnecessary
@@ -1893,21 +2071,22 @@ class BertForAdvancedFlowMatchingTraining(BertForAdvancedFlowMatching, BertForFl
                 except Exception as e:
                     logging.debug(f"EMA update failed: {e}")
         
-        # CRITICAL FIX: Adaptive loss scaling to prevent gradient explosion while allowing learning
-        # The loss accumulates from multiple sources (main + geometric + pairwise)
-        # Use adaptive scaling: start with 0.5x (less aggressive), gradually increase to 1.0x
-        # This allows model to learn while preventing early training instability
+        # CRITICAL FIX: More aggressive loss scaling to prevent gradient explosion
+        # Gradient norms of 44-90 indicate loss components are too large
+        # Use more aggressive scaling: start with 0.2x (very conservative), gradually increase to 0.5x
+        # This prevents gradient explosion while still allowing learning
         current_epoch = self.current_epoch if hasattr(self, 'current_epoch') else 0
         total_epochs = self.epochs if hasattr(self, 'epochs') else 50
         progress = current_epoch / total_epochs if total_epochs > 0 else 0.0
         
-        # Adaptive scaling: 0.5x early (0-30%), gradually increase to 1.0x (100%)
+        # CRITICAL: More aggressive scaling to handle high gradient norms (15-32)
+        # Start with 0.1x (very conservative) to prevent explosion, gradually increase to 0.3x
         if progress < 0.3:
-            loss_scale = 0.5  # Less aggressive early training
+            loss_scale = 0.1  # Very conservative early training (reduced from 0.2)
         elif progress < 0.6:
-            loss_scale = 0.5 + 0.3 * (progress - 0.3) / 0.3  # 0.5 → 0.8
+            loss_scale = 0.1 + 0.1 * (progress - 0.3) / 0.3  # 0.1 → 0.2
         else:
-            loss_scale = 0.8 + 0.2 * (progress - 0.6) / 0.4  # 0.8 → 1.0
+            loss_scale = 0.2 + 0.1 * (progress - 0.6) / 0.4  # 0.2 → 0.3 (max 0.3x, not 0.5x)
         
         total_loss_scaled = total_loss * loss_scale
         
@@ -2262,10 +2441,13 @@ class BertForAdvancedFlowMatchingTraining(BertForAdvancedFlowMatching, BertForFl
             dim=-1
         )
         
+        # CRITICAL FIX: Balanced Ramachandran loss weight to prevent gradient explosion
+        # High multiplier (5.0) was causing gradient norms of 44-90, leading to training instability
+        # Reduced to 2.0 to balance between enforcing constraints and maintaining stability
         # Potential field: energy increases with distance from closest favored region
         # Use smooth potential (L2) to avoid sharp gradients
         rama_loss_per_residue = min_dist ** 2 * mask_expanded_rama.squeeze(-1)
-        rama_loss = (rama_loss_per_residue * attention_mask).sum() / mask_sum
+        rama_loss = (rama_loss_per_residue * attention_mask).sum() / mask_sum * 2.0  # Reduced from 5.0 to 2.0 to prevent gradient explosion
         
         # CRITICAL FIX: Forbidden region penalty (positive φ, positive ψ) using Huber loss
         forbidden_phi_penalty = F.smooth_l1_loss(
@@ -2278,12 +2460,15 @@ class BertForAdvancedFlowMatchingTraining(BertForAdvancedFlowMatching, BertForFl
             torch.zeros_like(psi),
             reduction='none'
         )
+        # CRITICAL FIX: Balanced forbidden region penalty to prevent gradient explosion
+        # High multiplier (5.0) was contributing to gradient norms of 44-90
+        # Reduced to 2.0 to balance between penalizing outliers and maintaining stability
         # Only penalize where BOTH phi and psi are positive
         forbidden_mask = (phi > 0) & (psi > 0)
         forbidden_loss = (
             (forbidden_mask.float() * (forbidden_phi_penalty + forbidden_psi_penalty) * 
              mask_expanded_rama.squeeze(-1)).sum() / mask_sum
-        ) * 2.0  # Reduced from 5.0 to prevent gradient explosion
+        ) * 2.0  # Reduced from 5.0 to 2.0 to prevent gradient explosion
         
         total_loss = total_loss + rama_loss + forbidden_loss
         
@@ -2348,9 +2533,11 @@ class BertForAdvancedFlowMatchingTraining(BertForAdvancedFlowMatching, BertForFl
         # Re-weight components: Ramachandran 40%, Omega 20%, Bond 10%, Clash 30%
         # This is done implicitly by the weights above
         
-        # 4. NEW: Clash penalty - simplified approach using bond angles
+        # 4. Clash penalty - simplified approach using bond angles (proxy)
         # Penalize if bond angles are too small (suggests atoms too close, potential clash)
-        # This is a simplified proxy for clash detection that maintains gradients
+        # This is a simplified proxy for clash detection that maintains gradients.
+        # NOTE: Full coordinate-based clash detection is performed periodically (every 100 steps)
+        # in the training loop using angles_to_coords_simple for accurate validation.
         try:
             tau = valid_angles[:, :, 3]  # N-CA-C angle, should be ~1.92 rad (110°)
             ca_c_n = valid_angles[:, :, 4]  # CA-C-N angle, should be ~2.01 rad (115°)

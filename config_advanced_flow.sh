@@ -14,11 +14,11 @@ SAMPLES_DIR="${OUTPUT_BASE}/samples_${EXPERIMENT_NAME}"
 ANALYSIS_DIR="${OUTPUT_BASE}/analysis_${EXPERIMENT_NAME}"
 
 # Training parameters (OPTIMIZED FOR SOTA PERFORMANCE - 2025 IMPROVEMENTS)
-EPOCHS=100  # SOTA: 50-100 epochs for full convergence (increased from 30)
-BATCH_SIZE=16  # SOTA: Larger batch for stability (with gradient accumulation)
-ACCUMULATE_GRAD_BATCHES=4  # CRITICAL FIX: Increased from 2 to 4 to smooth gradients (reduces high pre-clip gradient norms)
-LR=5e-5  # CRITICAL FIX: Reduced from 5e-5 to 3e-5 for better stability (based on web research: lower LR for flow matching)
-LR_SCHEDULER="CosineAnnealing"  # SOTA: Cosine annealing for best convergence
+EPOCHS=150  # CRITICAL FIX: Increased from 100 to 150 for full convergence and to allow validation loss to decrease below 0.55
+BATCH_SIZE=16  # Current: 16 (effective batch = 16 * 2 = 32 with gradient accumulation)
+ACCUMULATE_GRAD_BATCHES=2  # CRITICAL FIX: Reduced from 4 to 2 (effective batch = 16 * 2 = 32)
+LR=2e-5  # CRITICAL FIX: Reduced from 3e-5 to 2e-5 to handle gradient norms 15-32 and improve stability
+LR_SCHEDULER="ReduceLROnPlateau"  # CRITICAL FIX: Changed from CosineAnnealing to ReduceLROnPlateau to adapt to validation loss plateaus
 WARMUP_RATIO=0.15  # SOTA: 15% warmup for stable training start (increased from 10%)
 HIDDEN_SIZE=512  # SOTA: Larger capacity (512→768 for better representation)
 NUM_LAYERS=12  # SOTA: Deeper network (12→16 for better capacity)
@@ -26,7 +26,7 @@ NUM_HEADS=16  # SOTA: Multi-head attention (maintained)
 MOTIF_MIN=5
 MOTIF_MAX=20
 GUIDANCE_DROPOUT=0.15  # SOTA: Optimal for generalization
-GRADIENT_CLIP=1.0  # CRITICAL FIX: Reduced from 1.0 to 0.5 to prevent gradient explosion (gradients reaching 35.8)
+GRADIENT_CLIP=0.5  # CRITICAL FIX: Reduced from 1.0 to 0.5 for more stable training and to prevent validation loss plateau
 
 # Flow matching parameters
 TIMESTEPS=1000
@@ -51,7 +51,7 @@ USE_MULTISCALE_LOSS=true
 USE_CONSISTENCY_LOSS=true
 USE_GEOMETRIC_LOSS=true
 CONSISTENCY_WEIGHT=0.15  # SOTA: Slightly higher for better sequence-structure alignment
-GEOMETRIC_WEIGHT=0.0  # CRITICAL FIX: Reduced from 0.2 to 0.15 to reduce clash rate (was causing 97.8% clash rate)
+GEOMETRIC_WEIGHT=0.20  # CRITICAL: Base weight (code applies 0.5x scaling → effective 0.10) to prevent gradient explosion (gradient norms 44-90)
 USE_OAT_FM=false  # NEW: OAT-FM (Optimal Acceleration Transport) - Optional, enable for better flow matching
 
 # Gradient Surgery (PCGrad) - Resolves conflicting gradients between flow matching and geometric loss
@@ -61,8 +61,8 @@ GRADIENT_SURGERY_THRESHOLD=0.0  # Apply surgery if gradient dot product < thresh
 
 # Geometric Loss Warmup - Gradually introduce geometric constraints after structure pre-training
 # Prevents "pinning" angles into favored regions before model learns global topology
-GEOMETRIC_WARMUP_START_STEP=50000  # Start warmup after this step (structure pre-training phase)
-GEOMETRIC_WARMUP_STEPS=10000  # Steps to gradually increase geometric loss weight (0 → 1.0)
+GEOMETRIC_WARMUP_START_STEP=5000  # Start warmup after this step (structure pre-training phase)
+GEOMETRIC_WARMUP_STEPS=1000 # Steps to gradually increase geometric loss weight (0 → 1.0)
 
 # Sampling parameters (optimized based on best practices - 2025 IMPROVEMENTS)
 N_SAMPLES=25  # More samples for better evaluation
@@ -77,7 +77,7 @@ MAX_REJECTION_ATTEMPTS=5  # Maximum attempts before accepting low-quality sample
 # Dataset configuration
 CATH_DIR="data/cath"
 ALPHAFOLD_DIR="data/alphafold/alphafoldpds"
-USE_COMBINED_DATASET=false  # Set to false to use only CATH dataset
+USE_COMBINED_DATASET=true  # Set to false to use only CATH dataset
 
 # Testing mode (for faster iteration)
 # Options: "toy", "small", "medium", "full"
