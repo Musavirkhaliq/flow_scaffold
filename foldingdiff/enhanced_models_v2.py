@@ -1429,7 +1429,7 @@ class BertForAdvancedFlowMatchingTraining(BertForAdvancedFlowMatching, BertForFl
         # We don't log here to avoid duplicate logs - see on_before_optimizer_step()
         pass
     
-    def on_before_optimizer_step(self, optimizer):
+    def on_before_optimizer_step(self, optimizer, optimizer_idx):
         """Monitor gradients before optimizer step (after all accumulation is done)"""
         # CRITICAL FIX: Log gradient norms only once per optimizer step (not during accumulation)
         # This prevents duplicate logs when using gradient accumulation
